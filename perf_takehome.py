@@ -248,11 +248,13 @@ class KernelBuilder:
             ("vbroadcast", v_hash_consts[5][1], hash_const_addrs[5][1]),
             ("vbroadcast", v_mul_4097, mul_const_addrs[0]),
         ]})
-        # Cycle 4: mul_33, mul_9
+        # Cycle 4: mul_33, mul_9 + load tree[0] (LOAD engine unused, saves 1 cycle later)
+        # Pre-allocate tree0_scalar here for overlap
+        tree0_scalar = self.alloc_scratch("tree0_scalar")
         self.instrs.append({"valu": [
             ("vbroadcast", v_mul_33, mul_const_addrs[1]),
             ("vbroadcast", v_mul_9, mul_const_addrs[2]),
-        ]})
+        ], "load": [("load", tree0_scalar, self.scratch["forest_values_p"])]})
 
         # Map stages to multiply_add vectors: stages 0, 2, 4 can use multiply_add
         mul_add_stages = {0: v_mul_4097, 2: v_mul_33, 4: v_mul_9}
@@ -305,12 +307,11 @@ class KernelBuilder:
         # ============================================
         # ROUND 0: All items have idx=0
         # Use broadcast instead of gather (big optimization!)
+        # tree[0] already loaded above during hash constant setup (overlapped)
         # ============================================
         v_tree0 = self.alloc_scratch("v_tree0", VLEN)
-        tree0_scalar = self.alloc_scratch("tree0_scalar")
 
-        # Load tree[0] and broadcast
-        self.instrs.append({"load": [("load", tree0_scalar, self.scratch["forest_values_p"])]})
+        # Broadcast tree[0] (already loaded above)
         self.instrs.append({"valu": [("vbroadcast", v_tree0, tree0_scalar)]})
 
         # Process all batches for round 0 (no gathers needed!)
