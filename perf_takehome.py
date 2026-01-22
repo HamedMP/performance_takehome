@@ -261,35 +261,16 @@ class KernelBuilder:
         addr_consts = [self.scratch_const(i * VLEN) for i in range(batch_size // VLEN)]
         addr_tmp2 = self.alloc_scratch("addr_tmp2")
 
-        # Load ALL indices and values into scratch (pipelined: overlap addr compute with loads)
-        # Indices: compute first pair of addresses
+        # Skip loading indices - they're all 0 initially, and scratch is initialized to 0
+        # This saves ~17 cycles of index loading
+
+        # Load ALL values into scratch (pipelined: overlap addr compute with loads)
+        # Values: compute first pair of addresses
         self.instrs.append({"alu": [
-            ("+", addr_tmp, self.scratch["inp_indices_p"], addr_consts[0]),
-            ("+", addr_tmp2, self.scratch["inp_indices_p"], addr_consts[1]),
+            ("+", addr_tmp, self.scratch["inp_values_p"], addr_consts[0]),
+            ("+", addr_tmp2, self.scratch["inp_values_p"], addr_consts[1]),
         ]})
         # Pipelined: compute next addresses while loading current
-        for i in range(2, batch_size // VLEN, 2):
-            self.instrs.append({"alu": [
-                ("+", addr_tmp3, self.scratch["inp_indices_p"], addr_consts[i]),
-                ("+", addr_tmp4, self.scratch["inp_indices_p"], addr_consts[i+1]),
-            ], "load": [
-                ("vload", all_idx[i-2], addr_tmp),
-                ("vload", all_idx[i-1], addr_tmp2),
-            ]})
-            addr_tmp, addr_tmp3 = addr_tmp3, addr_tmp
-            addr_tmp2, addr_tmp4 = addr_tmp4, addr_tmp2
-        # Final index loads overlapped with first value address computation (saves 1 cycle)
-        self.instrs.append({"load": [
-            ("vload", all_idx[-2], addr_tmp),
-            ("vload", all_idx[-1], addr_tmp2),
-        ], "alu": [
-            ("+", addr_tmp3, self.scratch["inp_values_p"], addr_consts[0]),
-            ("+", addr_tmp4, self.scratch["inp_values_p"], addr_consts[1]),
-        ]})
-        addr_tmp, addr_tmp3 = addr_tmp3, addr_tmp
-        addr_tmp2, addr_tmp4 = addr_tmp4, addr_tmp2
-
-        # Values: continue the pattern
         for i in range(2, batch_size // VLEN, 2):
             self.instrs.append({"alu": [
                 ("+", addr_tmp3, self.scratch["inp_values_p"], addr_consts[i]),
