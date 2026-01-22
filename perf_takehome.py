@@ -483,93 +483,105 @@ class KernelBuilder:
                 ("+", addr_cur_b, v_idx_cur_b, v_forest_p),
             ]})
 
-            # Gather current batch (8 cycles) overlapped with hash of previous batch (8 cycles for stages 0-3)
-            for gi in range(4):  # 4 gather cycles for A
-                load_ops = [
-                    ("load_offset", nv_a, addr_cur_a, gi * 2),
-                    ("load_offset", nv_a, addr_cur_a, gi * 2 + 1),
-                ]
-                # Overlap with hash stages 0-1 for previous batch
-                if gi < 2:
-                    hi = gi // 2 * 2 + gi % 2  # Map to hash stage 0 or 0
-                    hi = gi  # stages 0, 1 (need 2 cycles each, so gi=0,1->stage0, gi=2,3->stage1)
-                    hi = gi // 2  # 0,0,1,1
-                    h_stage = HASH_STAGES[hi]
-                    v_c1, v_c3 = v_hash_consts[hi]
-                    if gi % 2 == 0:
-                        valu_ops = [
-                            (h_stage[0], v_tmp1_a, v_val_prev_a, v_c1),
-                            (h_stage[3], v_tmp2_a, v_val_prev_a, v_c3),
-                            (h_stage[0], v_tmp1_b, v_val_prev_b, v_c1),
-                            (h_stage[3], v_tmp2_b, v_val_prev_b, v_c3),
-                        ]
-                    else:
-                        valu_ops = [
-                            (h_stage[2], v_val_prev_a, v_tmp1_a, v_tmp2_a),
-                            (h_stage[2], v_val_prev_b, v_tmp1_b, v_tmp2_b),
-                        ]
-                else:
-                    hi = gi // 2  # 1, 1 for gi=2,3
-                    h_stage = HASH_STAGES[hi]
-                    v_c1, v_c3 = v_hash_consts[hi]
-                    if gi % 2 == 0:
-                        valu_ops = [
-                            (h_stage[0], v_tmp1_a, v_val_prev_a, v_c1),
-                            (h_stage[3], v_tmp2_a, v_val_prev_a, v_c3),
-                            (h_stage[0], v_tmp1_b, v_val_prev_b, v_c1),
-                            (h_stage[3], v_tmp2_b, v_val_prev_b, v_c3),
-                        ]
-                    else:
-                        valu_ops = [
-                            (h_stage[2], v_val_prev_a, v_tmp1_a, v_tmp2_a),
-                            (h_stage[2], v_val_prev_b, v_tmp1_b, v_tmp2_b),
-                        ]
-                self.instrs.append({"load": load_ops, "valu": valu_ops})
+            # Gather current batch (8 cycles) overlapped with hash stages 0-4 for previous batch
+            # Using multiply_add for stages 0, 2, 4 allows fitting more hash work in gather window
+            # Schedule:
+            # gi=0: gather A[0,1], stage 0 (multiply_add)
+            # gi=1: gather A[2,3], stage 1 part 1 (tmp1, tmp2)
+            # gi=2: gather A[4,5], stage 1 part 2 (combine)
+            # gi=3: gather A[6,7], stage 2 (multiply_add)
+            # gi=4: gather B[0,1], stage 3 part 1 (tmp1, tmp2)
+            # gi=5: gather B[2,3], stage 3 part 2 (combine)
+            # gi=6: gather B[4,5], stage 4 (multiply_add) + idx*2
+            # gi=7: gather B[6,7], stage 5 part 1 (tmp1, tmp2)
 
-            for gi in range(4):  # 4 gather cycles for B
-                load_ops = [
-                    ("load_offset", nv_b, addr_cur_b, gi * 2),
-                    ("load_offset", nv_b, addr_cur_b, gi * 2 + 1),
-                ]
-                # Overlap with hash stages 2-3 for previous batch
-                hi = 2 + gi // 2
-                h_stage = HASH_STAGES[hi]
-                v_c1, v_c3 = v_hash_consts[hi]
-                if gi % 2 == 0:
-                    valu_ops = [
-                        (h_stage[0], v_tmp1_a, v_val_prev_a, v_c1),
-                        (h_stage[3], v_tmp2_a, v_val_prev_a, v_c3),
-                        (h_stage[0], v_tmp1_b, v_val_prev_b, v_c1),
-                        (h_stage[3], v_tmp2_b, v_val_prev_b, v_c3),
-                    ]
-                else:
-                    valu_ops = [
-                        (h_stage[2], v_val_prev_a, v_tmp1_a, v_tmp2_a),
-                        (h_stage[2], v_val_prev_b, v_tmp1_b, v_tmp2_b),
-                    ]
-                self.instrs.append({"load": load_ops, "valu": valu_ops})
-
-            # Hash stages 4-5 for previous batch - use multiply_add for stage 4
-            # Hash 4: val = val * 9 + c1 (multiply_add) + idx*2 overlapped
+            v_c1_0 = v_hash_consts[0][0]
+            v_c1_2 = v_hash_consts[2][0]
             v_c1_4 = v_hash_consts[4][0]
-            self.instrs.append({"valu": [
+            h_stage1 = HASH_STAGES[1]
+            v_c1_1, v_c3_1 = v_hash_consts[1]
+            h_stage3 = HASH_STAGES[3]
+            v_c1_3, v_c3_3 = v_hash_consts[3]
+            h_stage5 = HASH_STAGES[5]
+            v_c1_5, v_c3_5 = v_hash_consts[5]
+
+            # gi=0: gather A[0,1], stage 0 (multiply_add)
+            self.instrs.append({"load": [
+                ("load_offset", nv_a, addr_cur_a, 0),
+                ("load_offset", nv_a, addr_cur_a, 1),
+            ], "valu": [
+                ("multiply_add", v_val_prev_a, v_val_prev_a, v_mul_4097, v_c1_0),
+                ("multiply_add", v_val_prev_b, v_val_prev_b, v_mul_4097, v_c1_0),
+            ]})
+            # gi=1: gather A[2,3], stage 1 part 1
+            self.instrs.append({"load": [
+                ("load_offset", nv_a, addr_cur_a, 2),
+                ("load_offset", nv_a, addr_cur_a, 3),
+            ], "valu": [
+                (h_stage1[0], v_tmp1_a, v_val_prev_a, v_c1_1),
+                (h_stage1[3], v_tmp2_a, v_val_prev_a, v_c3_1),
+                (h_stage1[0], v_tmp1_b, v_val_prev_b, v_c1_1),
+                (h_stage1[3], v_tmp2_b, v_val_prev_b, v_c3_1),
+            ]})
+            # gi=2: gather A[4,5], stage 1 part 2
+            self.instrs.append({"load": [
+                ("load_offset", nv_a, addr_cur_a, 4),
+                ("load_offset", nv_a, addr_cur_a, 5),
+            ], "valu": [
+                (h_stage1[2], v_val_prev_a, v_tmp1_a, v_tmp2_a),
+                (h_stage1[2], v_val_prev_b, v_tmp1_b, v_tmp2_b),
+            ]})
+            # gi=3: gather A[6,7], stage 2 (multiply_add)
+            self.instrs.append({"load": [
+                ("load_offset", nv_a, addr_cur_a, 6),
+                ("load_offset", nv_a, addr_cur_a, 7),
+            ], "valu": [
+                ("multiply_add", v_val_prev_a, v_val_prev_a, v_mul_33, v_c1_2),
+                ("multiply_add", v_val_prev_b, v_val_prev_b, v_mul_33, v_c1_2),
+            ]})
+            # gi=4: gather B[0,1], stage 3 part 1
+            self.instrs.append({"load": [
+                ("load_offset", nv_b, addr_cur_b, 0),
+                ("load_offset", nv_b, addr_cur_b, 1),
+            ], "valu": [
+                (h_stage3[0], v_tmp1_a, v_val_prev_a, v_c1_3),
+                (h_stage3[3], v_tmp2_a, v_val_prev_a, v_c3_3),
+                (h_stage3[0], v_tmp1_b, v_val_prev_b, v_c1_3),
+                (h_stage3[3], v_tmp2_b, v_val_prev_b, v_c3_3),
+            ]})
+            # gi=5: gather B[2,3], stage 3 part 2
+            self.instrs.append({"load": [
+                ("load_offset", nv_b, addr_cur_b, 2),
+                ("load_offset", nv_b, addr_cur_b, 3),
+            ], "valu": [
+                (h_stage3[2], v_val_prev_a, v_tmp1_a, v_tmp2_a),
+                (h_stage3[2], v_val_prev_b, v_tmp1_b, v_tmp2_b),
+            ]})
+            # gi=6: gather B[4,5], stage 4 (multiply_add) + idx*2
+            self.instrs.append({"load": [
+                ("load_offset", nv_b, addr_cur_b, 4),
+                ("load_offset", nv_b, addr_cur_b, 5),
+            ], "valu": [
                 ("multiply_add", v_val_prev_a, v_val_prev_a, v_mul_9, v_c1_4),
                 ("multiply_add", v_val_prev_b, v_val_prev_b, v_mul_9, v_c1_4),
                 ("*", v_idx_prev_a, v_idx_prev_a, v_two),
                 ("*", v_idx_prev_b, v_idx_prev_b, v_two),
             ]})
-            # Hash 5: val = (val ^ c1) ^ (val >> 16) - can't use multiply_add
-            h_stage = HASH_STAGES[5]
-            v_c1, v_c3 = v_hash_consts[5]
-            self.instrs.append({"valu": [
-                (h_stage[0], v_tmp1_a, v_val_prev_a, v_c1),
-                (h_stage[3], v_tmp2_a, v_val_prev_a, v_c3),
-                (h_stage[0], v_tmp1_b, v_val_prev_b, v_c1),
-                (h_stage[3], v_tmp2_b, v_val_prev_b, v_c3),
+            # gi=7: gather B[6,7], stage 5 part 1
+            self.instrs.append({"load": [
+                ("load_offset", nv_b, addr_cur_b, 6),
+                ("load_offset", nv_b, addr_cur_b, 7),
+            ], "valu": [
+                (h_stage5[0], v_tmp1_a, v_val_prev_a, v_c1_5),
+                (h_stage5[3], v_tmp2_a, v_val_prev_a, v_c3_5),
+                (h_stage5[0], v_tmp1_b, v_val_prev_b, v_c1_5),
+                (h_stage5[3], v_tmp2_b, v_val_prev_b, v_c3_5),
             ]})
+
+            # Stage 5 part 2 (no longer overlapped with gather)
             self.instrs.append({"valu": [
-                (h_stage[2], v_val_prev_a, v_tmp1_a, v_tmp2_a),
-                (h_stage[2], v_val_prev_b, v_tmp1_b, v_tmp2_b),
+                (h_stage5[2], v_val_prev_a, v_tmp1_a, v_tmp2_a),
+                (h_stage5[2], v_val_prev_b, v_tmp1_b, v_tmp2_b),
             ]})
 
             # Index computation (idx*2 already done above)
@@ -822,69 +834,94 @@ class KernelBuilder:
                 ("+", addr_cur_b, v_idx_cur_b, v_forest_p),
             ]})
 
-            for gi in range(4):
-                load_ops = [
-                    ("load_offset", nv_a, addr_cur_a, gi * 2),
-                    ("load_offset", nv_a, addr_cur_a, gi * 2 + 1),
-                ]
-                hi = gi // 2
-                h_stage = HASH_STAGES[hi]
-                v_c1, v_c3 = v_hash_consts[hi]
-                if gi % 2 == 0:
-                    valu_ops = [
-                        (h_stage[0], v_tmp1_a, v_val_prev_a, v_c1),
-                        (h_stage[3], v_tmp2_a, v_val_prev_a, v_c3),
-                        (h_stage[0], v_tmp1_b, v_val_prev_b, v_c1),
-                        (h_stage[3], v_tmp2_b, v_val_prev_b, v_c3),
-                    ]
-                else:
-                    valu_ops = [
-                        (h_stage[2], v_val_prev_a, v_tmp1_a, v_tmp2_a),
-                        (h_stage[2], v_val_prev_b, v_tmp1_b, v_tmp2_b),
-                    ]
-                self.instrs.append({"load": load_ops, "valu": valu_ops})
-
-            for gi in range(4):
-                load_ops = [
-                    ("load_offset", nv_b, addr_cur_b, gi * 2),
-                    ("load_offset", nv_b, addr_cur_b, gi * 2 + 1),
-                ]
-                hi = 2 + gi // 2
-                h_stage = HASH_STAGES[hi]
-                v_c1, v_c3 = v_hash_consts[hi]
-                if gi % 2 == 0:
-                    valu_ops = [
-                        (h_stage[0], v_tmp1_a, v_val_prev_a, v_c1),
-                        (h_stage[3], v_tmp2_a, v_val_prev_a, v_c3),
-                        (h_stage[0], v_tmp1_b, v_val_prev_b, v_c1),
-                        (h_stage[3], v_tmp2_b, v_val_prev_b, v_c3),
-                    ]
-                else:
-                    valu_ops = [
-                        (h_stage[2], v_val_prev_a, v_tmp1_a, v_tmp2_a),
-                        (h_stage[2], v_val_prev_b, v_tmp1_b, v_tmp2_b),
-                    ]
-                self.instrs.append({"load": load_ops, "valu": valu_ops})
-
-            # Hash stages 4-5 - use multiply_add for stage 4
+            # Restructured pipelined hash with multiply_add for stages 0, 2, 4
+            v_c1_0 = v_hash_consts[0][0]
+            v_c1_2 = v_hash_consts[2][0]
             v_c1_4 = v_hash_consts[4][0]
-            self.instrs.append({"valu": [
+            h_stage1 = HASH_STAGES[1]
+            v_c1_1, v_c3_1 = v_hash_consts[1]
+            h_stage3 = HASH_STAGES[3]
+            v_c1_3, v_c3_3 = v_hash_consts[3]
+            h_stage5 = HASH_STAGES[5]
+            v_c1_5, v_c3_5 = v_hash_consts[5]
+
+            # gi=0: gather A[0,1], stage 0 (multiply_add)
+            self.instrs.append({"load": [
+                ("load_offset", nv_a, addr_cur_a, 0),
+                ("load_offset", nv_a, addr_cur_a, 1),
+            ], "valu": [
+                ("multiply_add", v_val_prev_a, v_val_prev_a, v_mul_4097, v_c1_0),
+                ("multiply_add", v_val_prev_b, v_val_prev_b, v_mul_4097, v_c1_0),
+            ]})
+            # gi=1: gather A[2,3], stage 1 part 1
+            self.instrs.append({"load": [
+                ("load_offset", nv_a, addr_cur_a, 2),
+                ("load_offset", nv_a, addr_cur_a, 3),
+            ], "valu": [
+                (h_stage1[0], v_tmp1_a, v_val_prev_a, v_c1_1),
+                (h_stage1[3], v_tmp2_a, v_val_prev_a, v_c3_1),
+                (h_stage1[0], v_tmp1_b, v_val_prev_b, v_c1_1),
+                (h_stage1[3], v_tmp2_b, v_val_prev_b, v_c3_1),
+            ]})
+            # gi=2: gather A[4,5], stage 1 part 2
+            self.instrs.append({"load": [
+                ("load_offset", nv_a, addr_cur_a, 4),
+                ("load_offset", nv_a, addr_cur_a, 5),
+            ], "valu": [
+                (h_stage1[2], v_val_prev_a, v_tmp1_a, v_tmp2_a),
+                (h_stage1[2], v_val_prev_b, v_tmp1_b, v_tmp2_b),
+            ]})
+            # gi=3: gather A[6,7], stage 2 (multiply_add)
+            self.instrs.append({"load": [
+                ("load_offset", nv_a, addr_cur_a, 6),
+                ("load_offset", nv_a, addr_cur_a, 7),
+            ], "valu": [
+                ("multiply_add", v_val_prev_a, v_val_prev_a, v_mul_33, v_c1_2),
+                ("multiply_add", v_val_prev_b, v_val_prev_b, v_mul_33, v_c1_2),
+            ]})
+            # gi=4: gather B[0,1], stage 3 part 1
+            self.instrs.append({"load": [
+                ("load_offset", nv_b, addr_cur_b, 0),
+                ("load_offset", nv_b, addr_cur_b, 1),
+            ], "valu": [
+                (h_stage3[0], v_tmp1_a, v_val_prev_a, v_c1_3),
+                (h_stage3[3], v_tmp2_a, v_val_prev_a, v_c3_3),
+                (h_stage3[0], v_tmp1_b, v_val_prev_b, v_c1_3),
+                (h_stage3[3], v_tmp2_b, v_val_prev_b, v_c3_3),
+            ]})
+            # gi=5: gather B[2,3], stage 3 part 2
+            self.instrs.append({"load": [
+                ("load_offset", nv_b, addr_cur_b, 2),
+                ("load_offset", nv_b, addr_cur_b, 3),
+            ], "valu": [
+                (h_stage3[2], v_val_prev_a, v_tmp1_a, v_tmp2_a),
+                (h_stage3[2], v_val_prev_b, v_tmp1_b, v_tmp2_b),
+            ]})
+            # gi=6: gather B[4,5], stage 4 (multiply_add) + idx*2
+            self.instrs.append({"load": [
+                ("load_offset", nv_b, addr_cur_b, 4),
+                ("load_offset", nv_b, addr_cur_b, 5),
+            ], "valu": [
                 ("multiply_add", v_val_prev_a, v_val_prev_a, v_mul_9, v_c1_4),
                 ("multiply_add", v_val_prev_b, v_val_prev_b, v_mul_9, v_c1_4),
                 ("*", v_idx_prev_a, v_idx_prev_a, v_two),
                 ("*", v_idx_prev_b, v_idx_prev_b, v_two),
             ]})
-            h_stage = HASH_STAGES[5]
-            v_c1, v_c3 = v_hash_consts[5]
-            self.instrs.append({"valu": [
-                (h_stage[0], v_tmp1_a, v_val_prev_a, v_c1),
-                (h_stage[3], v_tmp2_a, v_val_prev_a, v_c3),
-                (h_stage[0], v_tmp1_b, v_val_prev_b, v_c1),
-                (h_stage[3], v_tmp2_b, v_val_prev_b, v_c3),
+            # gi=7: gather B[6,7], stage 5 part 1
+            self.instrs.append({"load": [
+                ("load_offset", nv_b, addr_cur_b, 6),
+                ("load_offset", nv_b, addr_cur_b, 7),
+            ], "valu": [
+                (h_stage5[0], v_tmp1_a, v_val_prev_a, v_c1_5),
+                (h_stage5[3], v_tmp2_a, v_val_prev_a, v_c3_5),
+                (h_stage5[0], v_tmp1_b, v_val_prev_b, v_c1_5),
+                (h_stage5[3], v_tmp2_b, v_val_prev_b, v_c3_5),
             ]})
+
+            # Stage 5 part 2
             self.instrs.append({"valu": [
-                (h_stage[2], v_val_prev_a, v_tmp1_a, v_tmp2_a),
-                (h_stage[2], v_val_prev_b, v_tmp1_b, v_tmp2_b),
+                (h_stage5[2], v_val_prev_a, v_tmp1_a, v_tmp2_a),
+                (h_stage5[2], v_val_prev_b, v_tmp1_b, v_tmp2_b),
             ]})
 
             self.instrs.append({"valu": [
