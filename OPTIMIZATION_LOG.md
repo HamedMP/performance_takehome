@@ -674,4 +674,49 @@ Would require either:
 ## Files Added
 - `PROBLEM_HISTORY.md` - Benchmark targets from Anthropic blog
 - `debug_tools.py` - Profiling and analysis tools
+- `TRANSPOSE_ANALYSIS.md` - Detailed exploration of "transpose computation" approaches
+
+---
+
+## Deep Analysis: LOAD Utilization During Rounds 0-2
+
+**Finding:**
+During rounds 0-2 (and 11-13), there are **288 cycles** where VALU is busy (>=3 slots) but LOAD is completely idle!
+
+**Opportunity:**
+- Available LOAD bandwidth: 576 loads (288 cycles × 2 loads/cycle)
+- Tree values for rounds 3-6: only 120 values
+- PLENTY of capacity to preload tree values!
+
+**Challenge:**
+Preloaded values can only help if we can use them WITHOUT gather.
+- Using selection (VALU) is WORSE than gather due to VALU contention
+- The gather-hash overlap is too efficient to beat
+
+**Conclusion:**
+Preloading doesn't help unless we find a fundamentally different way to use the values.
+
+---
+
+## Transpose Computation Analysis Summary
+
+Explored multiple interpretations of "transposing the entire computation":
+
+1. **Swap round/batch order**: Doesn't reduce gather count
+2. **Item-major processing**: Loses SIMD parallelism (terrible)
+3. **Selection instead of gather**: VALU contention makes it worse
+4. **Preload + selection pipeline**: Still limited by VALU
+5. **Sort items by tree path**: High overhead for small groups
+6. **Batch size optimization**: 6-vector batches slightly better but complex
+7. **Round-staggered processing**: Complex with unclear benefit
+
+**Key Insight:**
+The gather-hash pipeline overlap (LOAD + VALU parallel) is the critical optimization.
+Any approach that moves work from LOAD to VALU breaks this overlap.
+
+**What "Transpose" Might Mean:**
+Still unclear. The breakthrough likely involves either:
+- A completely different algorithmic structure
+- Exploiting some property of the tree/hash we haven't identified
+- A novel scheduling technique
 
