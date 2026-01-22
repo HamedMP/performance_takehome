@@ -362,8 +362,60 @@ Round | Unique Indices | Max Index
 - Per batch total: ~17-18 cycles
 - Per round: ~310 cycles × 14 rounds = 4,340 cycles
 
+---
+
+## Experiment 16: Rounds 11-12 Optimization
+
+**What I did:**
+- After round 10 completes, all items wrap to idx=0 (same as round 0)
+- After round 11 completes, all items have idx=1 or 2 (same as round 1)
+- Split the main loop into two loops: rounds 2-10 and rounds 13-15
+- Added inline round 11 (broadcast) and round 12 (arithmetic) between loops
+
+**Result:** 4,381 cycles (33.7x speedup, saved 307 cycles from 4,688)
+
+**Analysis:**
+- Saved ~300 cycles by eliminating gathers for rounds 11 and 12
+- First loop runs 9 iterations (rounds 2-10)
+- Inline round 11 uses broadcast (all idx=0)
+- Inline round 12 uses arithmetic (idx=1 or 2)
+- Second loop runs 3 iterations (rounds 13-15)
+- Total gather rounds reduced from 14 to 12
+
+---
+
+## Current State Summary (Updated)
+
+**Best Result:** 4,381 cycles (33.7x speedup from 147,734 baseline)
+
+**What Works:**
+- Round 0: Broadcast instead of gather (~130 cycles saved)
+- Round 1: Arithmetic instead of gather (~180 cycles saved)
+- Round 11: Broadcast instead of gather (~150 cycles saved)
+- Round 12: Arithmetic instead of gather (~150 cycles saved)
+- Rounds 2-10, 13-15: Pipelined gather/hash overlap (12 gather rounds)
+
+**Remaining Gap:**
+- Current: 4,381 cycles
+- Target: 1,487 cycles
+- Need: 2.9x additional improvement
+
+**Theoretical Analysis:**
+- 12 gather rounds × 128 cycles/round (minimum) = 1,536 cycles just for gathers
+- Target 1,487 < 1,536, which is impossible without reducing gather rounds further
+- Each gather round currently takes ~290 cycles (128 gather + ~160 hash/index overhead)
+
+**Possible Further Optimizations:**
+1. Round 2 and 13 bilinear interpolation (4 values each) - complex register management
+2. Round 3 and 14 one-hot masking (8 values each) - expensive but possible
+3. Speculative loading of tree values during computation
+4. Multi-round fusion to reduce loop overhead
+
 **To Reach Target:**
-Would need to eliminate gathers for most rounds, which requires either:
-1. Arithmetic computation for rounds 2-9 (didn't work - too expensive)
-2. Fundamentally different algorithm
-3. Process more items per cycle (limited by hardware)
+Would need to:
+1. Eliminate gathers for rounds 2-5 and 13-15 (reducing from 12 to ~4 gather rounds)
+2. Achieve near-perfect pipelining for remaining rounds
+3. Both are technically challenging due to:
+   - Register pressure for arithmetic/masking approaches
+   - Complex index ranges (4, 8, 16, 32 values for rounds 2-5)
+   - Loop structure makes cross-round optimization difficult
