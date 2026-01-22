@@ -198,28 +198,45 @@ class KernelBuilder:
 
         self.add("flow", ("pause",))
 
-        # Initialize broadcast vectors
+        # Initialize broadcast vectors - pack 6 per cycle for efficiency (11 cycles -> 4)
+        # Pre-allocate const addresses for hash stages
+        hash_const_addrs = []
+        for hi, (op1, val1, op2, op3, val3) in enumerate(HASH_STAGES):
+            hash_const_addrs.append((self.scratch_const(val1), self.scratch_const(val3)))
+        mul_const_addrs = [self.scratch_const(mul_val) for _, _, mul_val in mul_consts]
+
+        # Cycle 1: v_zero, v_one, v_two, v_n_nodes, v_forest_p, hash[0][0]
         self.instrs.append({"valu": [
             ("vbroadcast", v_zero, zero_const),
             ("vbroadcast", v_one, one_const),
             ("vbroadcast", v_two, two_const),
-        ]})
-        self.instrs.append({"valu": [
             ("vbroadcast", v_n_nodes, self.scratch["n_nodes"]),
             ("vbroadcast", v_forest_p, self.scratch["forest_values_p"]),
+            ("vbroadcast", v_hash_consts[0][0], hash_const_addrs[0][0]),
         ]})
-        for hi, (op1, val1, op2, op3, val3) in enumerate(HASH_STAGES):
-            c1_addr = self.scratch_const(val1)
-            c3_addr = self.scratch_const(val3)
-            self.instrs.append({"valu": [
-                ("vbroadcast", v_hash_consts[hi][0], c1_addr),
-                ("vbroadcast", v_hash_consts[hi][1], c3_addr),
-            ]})
-
-        # Broadcast multiply_add constants
-        for hi, v_mul, mul_val in mul_consts:
-            mul_addr = self.scratch_const(mul_val)
-            self.instrs.append({"valu": [("vbroadcast", v_mul, mul_addr)]})
+        # Cycle 2: hash[0][1], [1][0], [1][1], [2][0], [2][1], [3][0]
+        self.instrs.append({"valu": [
+            ("vbroadcast", v_hash_consts[0][1], hash_const_addrs[0][1]),
+            ("vbroadcast", v_hash_consts[1][0], hash_const_addrs[1][0]),
+            ("vbroadcast", v_hash_consts[1][1], hash_const_addrs[1][1]),
+            ("vbroadcast", v_hash_consts[2][0], hash_const_addrs[2][0]),
+            ("vbroadcast", v_hash_consts[2][1], hash_const_addrs[2][1]),
+            ("vbroadcast", v_hash_consts[3][0], hash_const_addrs[3][0]),
+        ]})
+        # Cycle 3: hash[3][1], [4][0], [4][1], [5][0], [5][1], mul_4097
+        self.instrs.append({"valu": [
+            ("vbroadcast", v_hash_consts[3][1], hash_const_addrs[3][1]),
+            ("vbroadcast", v_hash_consts[4][0], hash_const_addrs[4][0]),
+            ("vbroadcast", v_hash_consts[4][1], hash_const_addrs[4][1]),
+            ("vbroadcast", v_hash_consts[5][0], hash_const_addrs[5][0]),
+            ("vbroadcast", v_hash_consts[5][1], hash_const_addrs[5][1]),
+            ("vbroadcast", v_mul_4097, mul_const_addrs[0]),
+        ]})
+        # Cycle 4: mul_33, mul_9
+        self.instrs.append({"valu": [
+            ("vbroadcast", v_mul_33, mul_const_addrs[1]),
+            ("vbroadcast", v_mul_9, mul_const_addrs[2]),
+        ]})
 
         # Map stages to multiply_add vectors: stages 0, 2, 4 can use multiply_add
         mul_add_stages = {0: v_mul_4097, 2: v_mul_33, 4: v_mul_9}
@@ -277,6 +294,16 @@ class KernelBuilder:
         v_addr_a2 = self.alloc_scratch("v_addr_a2", VLEN)
         v_addr_b2 = self.alloc_scratch("v_addr_b2", VLEN)
 
+        # Additional registers for 4-vector batching
+        v_node_val_c = self.alloc_scratch("v_node_val_c", VLEN)
+        v_node_val_c2 = self.alloc_scratch("v_node_val_c2", VLEN)
+        v_node_val_d = self.alloc_scratch("v_node_val_d", VLEN)
+        v_node_val_d2 = self.alloc_scratch("v_node_val_d2", VLEN)
+        v_addr_c = self.alloc_scratch("v_addr_c", VLEN)
+        v_addr_c2 = self.alloc_scratch("v_addr_c2", VLEN)
+        v_addr_d = self.alloc_scratch("v_addr_d", VLEN)
+        v_addr_d2 = self.alloc_scratch("v_addr_d2", VLEN)
+
         # ============================================
         # ROUND 0: All items have idx=0
         # Use broadcast instead of gather (big optimization!)
@@ -298,6 +325,11 @@ class KernelBuilder:
         v_tmp2_d = self.alloc_scratch("v_tmp2_d", VLEN)
         v_tmp2_e = self.alloc_scratch("v_tmp2_e", VLEN)
         v_tmp2_f = self.alloc_scratch("v_tmp2_f", VLEN)
+        # Additional tmp3 registers for 2-bit selection optimization
+        v_tmp3_c = self.alloc_scratch("v_tmp3_c", VLEN)
+        v_tmp3_d = self.alloc_scratch("v_tmp3_d", VLEN)
+        v_tmp3_e = self.alloc_scratch("v_tmp3_e", VLEN)
+        v_tmp3_f = self.alloc_scratch("v_tmp3_f", VLEN)
 
         # Process 6 vectors (48 items) at a time for better valu utilization
         # 32 vectors / 6 = 5.33, so process in chunks: 6, 6, 6, 6, 6, 2
@@ -370,11 +402,16 @@ class KernelBuilder:
         self.instrs.append({"alu": [("+", addr_tmp, self.scratch["forest_values_p"], two_const)]})
         self.instrs.append({"load": [("load", tree2_scalar, addr_tmp)]})
 
-        # Compute diff = tree2 - tree1 and broadcast
+        # Compute diff = tree2 - tree1 and c = tree1 - diff for multiply_add optimization
+        # node_val = tree1 + (idx - 1) * diff = idx * diff + (tree1 - diff) = multiply_add(idx, diff, c)
+        c_scalar = self.alloc_scratch("c_scalar")
+        v_c = self.alloc_scratch("v_c", VLEN)
         self.instrs.append({"alu": [("-", diff_scalar, tree2_scalar, tree1_scalar)]})
+        self.instrs.append({"alu": [("-", c_scalar, tree1_scalar, diff_scalar)]})
         self.instrs.append({"valu": [
             ("vbroadcast", v_tree1, tree1_scalar),
             ("vbroadcast", v_diff, diff_scalar),
+            ("vbroadcast", v_c, c_scalar),
         ]})
 
         # Process all vectors for round 1
@@ -383,19 +420,11 @@ class KernelBuilder:
             tmp1_list = [v_tmp1_a, v_tmp1_b, v_tmp1_c, v_tmp1_d, v_tmp1_e, v_tmp1_f][:num_vecs]
             tmp2_list = [v_tmp2_a, v_tmp2_b, v_tmp2_c, v_tmp2_d, v_tmp2_e, v_tmp2_f][:num_vecs]
 
-            # Compute node_val = tree1 + (idx - 1) * diff for each item
-            # First: offset = idx - 1
-            offset_ops = [("-", t1, v_idx, v_one) for (v_idx, v_val), t1 in zip(vecs, tmp1_list)]
-            self.instrs.append({"valu": offset_ops})
+            # Compute node_val = idx * diff + c using multiply_add (3 cycles -> 1 cycle)
+            node_val_ops = [("multiply_add", t1, v_idx, v_diff, v_c) for (v_idx, v_val), t1 in zip(vecs, tmp1_list)]
+            self.instrs.append({"valu": node_val_ops})
 
-            # node_val = tree1 + offset * diff = tree1 + tmp1 * diff
-            mul_ops = [("*", t2, t1, v_diff) for t1, t2 in zip(tmp1_list[:num_vecs], tmp2_list[:num_vecs])]
-            self.instrs.append({"valu": mul_ops})
-
-            add_node_ops = [("+", t1, v_tree1, t2) for t1, t2 in zip(tmp1_list[:num_vecs], tmp2_list[:num_vecs])]
-            self.instrs.append({"valu": add_node_ops})
-
-            # XOR: val = val ^ node_val (node_val is in tmp1_list now)
+            # XOR: val = val ^ node_val (node_val is in tmp1_list)
             xor_ops = [("^", v_val, v_val, t1) for (v_idx, v_val), t1 in zip(vecs, tmp1_list)]
             self.instrs.append({"valu": xor_ops})
 
@@ -430,16 +459,13 @@ class KernelBuilder:
                     combine_ops = [(op2, v_val, t1, t2) for (v_idx, v_val), t1, t2 in zip(vecs, tmp1_list, tmp2_list)]
                     self.instrs.append({"valu": combine_ops})
 
-            # Index computation: new_idx = idx * 2 + (1 + (val & 1))
-            # idx is 1 or 2, so idx*2 is 2 or 4
-            mul_idx_ops = [("*", v_idx, v_idx, v_two) for (v_idx, v_val) in vecs]
-            self.instrs.append({"valu": mul_idx_ops})
+            # Index computation: new_idx = idx * 2 + 1 + (val & 1)
+            # Use multiply_add to combine idx*2+1, then add (val&1) (6 cycles -> 5)
+            mul_add_idx_ops = [("multiply_add", v_idx, v_idx, v_two, v_one) for (v_idx, v_val) in vecs]
+            self.instrs.append({"valu": mul_add_idx_ops})
 
             and_ops = [("&", t1, v_val, v_one) for (v_idx, v_val), t1 in zip(vecs, tmp1_list)]
             self.instrs.append({"valu": and_ops})
-
-            add_one_ops = [("+", t1, v_one, t1) for t1 in tmp1_list[:num_vecs]]
-            self.instrs.append({"valu": add_one_ops})
 
             add_idx_ops = [("+", v_idx, v_idx, t1) for (v_idx, v_val), t1 in zip(vecs, tmp1_list)]
             self.instrs.append({"valu": add_idx_ops})
@@ -490,58 +516,63 @@ class KernelBuilder:
             ("load", tree5_scalar, addr_tmp),
             ("load", tree6_scalar, addr_tmp2),
         ]})
+        # Pre-compute diff values for 2-bit selection (saves 2 cycles per batch)
+        diff_low_scalar = self.alloc_scratch("diff_low_scalar")
+        diff_high_scalar = self.alloc_scratch("diff_high_scalar")
+        v_diff_low = self.alloc_scratch("v_diff_low", VLEN)
+        v_diff_high = self.alloc_scratch("v_diff_high", VLEN)
+        # diff_low = tree3 - tree4, diff_high = tree5 - tree6
+        self.instrs.append({"alu": [
+            ("-", diff_low_scalar, tree3_scalar, tree4_scalar),
+            ("-", diff_high_scalar, tree5_scalar, tree6_scalar),
+        ]})
         self.instrs.append({"valu": [
             ("vbroadcast", v_tree3, tree3_scalar),
             ("vbroadcast", v_tree4, tree4_scalar),
             ("vbroadcast", v_tree5, tree5_scalar),
             ("vbroadcast", v_tree6, tree6_scalar),
-            ("vbroadcast", v_three, three_const),
-            ("vbroadcast", v_four, four_const),
+            ("vbroadcast", v_five, five_const),
+            ("vbroadcast", v_diff_low, diff_low_scalar),
         ]})
         self.instrs.append({"valu": [
-            ("vbroadcast", v_five, five_const),
-            ("vbroadcast", v_six, six_const),
+            ("vbroadcast", v_diff_high, diff_high_scalar),
         ]})
 
-        # Process all vectors for round 2 using one-hot selection
-        # node_val = tree[3]*(idx==3) + tree[4]*(idx==4) + tree[5]*(idx==5) + tree[6]*(idx==6)
+        # Process all vectors for round 2 using 2-bit selection (8 cycles -> 6 cycles per batch)
+        # node_val = tree[idx] where idx is 3, 4, 5, or 6
+        # Use: cmp_lt5 = (idx < 5), cmp_odd = (idx & 1)
+        # base_low = tree4 + cmp_odd * (tree3 - tree4)
+        # base_high = tree6 + cmp_odd * (tree5 - tree6)
+        # node_val = base_high + cmp_lt5 * (base_low - base_high)
         for start_vec, num_vecs in vec_batches:
             vecs = [(all_idx[i], all_val[i]) for i in range(start_vec, start_vec + num_vecs)]
             tmp1_list = [v_tmp1_a, v_tmp1_b, v_tmp1_c, v_tmp1_d, v_tmp1_e, v_tmp1_f][:num_vecs]
             tmp2_list = [v_tmp2_a, v_tmp2_b, v_tmp2_c, v_tmp2_d, v_tmp2_e, v_tmp2_f][:num_vecs]
-            tmp3_list = [v_tmp3_a, v_tmp3_b, v_tmp1_c, v_tmp1_d, v_tmp1_e, v_tmp1_f][:num_vecs]
+            tmp3_list = [v_tmp3_a, v_tmp3_b, v_tmp3_c, v_tmp3_d, v_tmp3_e, v_tmp3_f][:num_vecs]
 
-            # Compute masks and use multiply_add to accumulate:
-            # node_val = tree3*mask3 + tree4*mask4 + tree5*mask5 + tree6*mask6
+            # Step 1: cmp_lt5 = (idx < 5) -> tmp1_list
+            cmp_lt5_ops = [("<", t1, v_idx, v_five) for (v_idx, v_val), t1 in zip(vecs, tmp1_list)]
+            self.instrs.append({"valu": cmp_lt5_ops})
 
-            # Step 1: mask3 = (idx == 3), node_val = tree3 * mask3
-            eq3_ops = [("==", t1, v_idx, v_three) for (v_idx, v_val), t1 in zip(vecs, tmp1_list)]
-            self.instrs.append({"valu": eq3_ops})
+            # Step 2: cmp_odd = (idx & 1) -> tmp2_list
+            cmp_odd_ops = [("&", t2, v_idx, v_one) for (v_idx, v_val), t2 in zip(vecs, tmp2_list)]
+            self.instrs.append({"valu": cmp_odd_ops})
 
-            mul3_ops = [("*", t2, v_tree3, t1) for t1, t2 in zip(tmp1_list[:num_vecs], tmp2_list[:num_vecs])]
-            self.instrs.append({"valu": mul3_ops})
+            # Step 3: base_low = tree4 + cmp_odd * diff_low = multiply_add(cmp_odd, diff_low, tree4) -> tmp3_list
+            base_low_ops = [("multiply_add", t3, t2, v_diff_low, v_tree4) for t2, t3 in zip(tmp2_list[:num_vecs], tmp3_list[:num_vecs])]
+            self.instrs.append({"valu": base_low_ops})
 
-            # Step 2: mask4 = (idx == 4), node_val = tree4 * mask4 + node_val (multiply_add)
-            eq4_ops = [("==", t1, v_idx, v_four) for (v_idx, v_val), t1 in zip(vecs, tmp1_list)]
-            self.instrs.append({"valu": eq4_ops})
+            # Step 4: base_high = tree6 + cmp_odd * diff_high = multiply_add(cmp_odd, diff_high, tree6) -> tmp2_list (overwrite)
+            base_high_ops = [("multiply_add", t2, t2, v_diff_high, v_tree6) for t2 in tmp2_list[:num_vecs]]
+            self.instrs.append({"valu": base_high_ops})
 
-            # multiply_add: dest = a * b + c, so node_val = tree4 * mask4 + node_val
-            ma4_ops = [("multiply_add", t2, v_tree4, t1, t2) for t1, t2 in zip(tmp1_list[:num_vecs], tmp2_list[:num_vecs])]
-            self.instrs.append({"valu": ma4_ops})
+            # Step 5: diff_bases = base_low - base_high -> tmp3_list (overwrite)
+            diff_bases_ops = [("-", t3, t3, t2) for t2, t3 in zip(tmp2_list[:num_vecs], tmp3_list[:num_vecs])]
+            self.instrs.append({"valu": diff_bases_ops})
 
-            # Step 3: mask5 = (idx == 5), node_val = tree5 * mask5 + node_val
-            eq5_ops = [("==", t1, v_idx, v_five) for (v_idx, v_val), t1 in zip(vecs, tmp1_list)]
-            self.instrs.append({"valu": eq5_ops})
-
-            ma5_ops = [("multiply_add", t2, v_tree5, t1, t2) for t1, t2 in zip(tmp1_list[:num_vecs], tmp2_list[:num_vecs])]
-            self.instrs.append({"valu": ma5_ops})
-
-            # Step 4: mask6 = (idx == 6), node_val = tree6 * mask6 + node_val
-            eq6_ops = [("==", t1, v_idx, v_six) for (v_idx, v_val), t1 in zip(vecs, tmp1_list)]
-            self.instrs.append({"valu": eq6_ops})
-
-            ma6_ops = [("multiply_add", t1, v_tree6, t1, t2) for t1, t2 in zip(tmp1_list[:num_vecs], tmp2_list[:num_vecs])]
-            self.instrs.append({"valu": ma6_ops})
+            # Step 6: node_val = base_high + cmp_lt5 * diff_bases = multiply_add(cmp_lt5, diff_bases, base_high) -> tmp1_list
+            node_val_ops = [("multiply_add", t1, t1, t3, t2) for t1, t2, t3 in zip(tmp1_list[:num_vecs], tmp2_list[:num_vecs], tmp3_list[:num_vecs])]
+            self.instrs.append({"valu": node_val_ops})
             # Now tmp1_list[i] contains node_val for each vector
 
             # XOR: val = val ^ node_val
@@ -579,15 +610,13 @@ class KernelBuilder:
                     combine_ops = [(op2, v_val, t1, t2) for (v_idx, v_val), t1, t2 in zip(vecs, tmp1_list, tmp2_list)]
                     self.instrs.append({"valu": combine_ops})
 
-            # Index computation: new_idx = idx * 2 + (1 + (val & 1))
-            mul_idx_ops = [("*", v_idx, v_idx, v_two) for (v_idx, v_val) in vecs]
-            self.instrs.append({"valu": mul_idx_ops})
+            # Index computation: new_idx = idx * 2 + 1 + (val & 1)
+            # Use multiply_add to combine idx*2+1 (6 cycles -> 5)
+            mul_add_idx_ops = [("multiply_add", v_idx, v_idx, v_two, v_one) for (v_idx, v_val) in vecs]
+            self.instrs.append({"valu": mul_add_idx_ops})
 
             and_ops = [("&", t1, v_val, v_one) for (v_idx, v_val), t1 in zip(vecs, tmp1_list)]
             self.instrs.append({"valu": and_ops})
-
-            add_one_ops = [("+", t1, v_one, t1) for t1 in tmp1_list[:num_vecs]]
-            self.instrs.append({"valu": add_one_ops})
 
             add_idx_ops = [("+", v_idx, v_idx, t1) for (v_idx, v_val), t1 in zip(vecs, tmp1_list)]
             self.instrs.append({"valu": add_idx_ops})
@@ -600,222 +629,444 @@ class KernelBuilder:
             self.instrs.append({"valu": wrap_ops})
 
         # ============================================
-        # ROUNDS 3 to rounds-1: Regular pipelined loop
+        # ROUNDS 3 to 10: 4-vector pipelined loop
         # ============================================
         self.instrs.append({"load": [("const", round_counter, 3)]})  # Start at round 3
+
+        # 4-VECTOR PIPELINED INNER LOOP
+        # Process 4 vectors per batch (8 batches total for 32 vectors)
+        # 16 gather cycles per batch (4 vectors × 8 elements / 2 loads per cycle)
+        NUM_BATCHES_4 = batch_size // (VLEN * 4)  # 8 batches
+
+        # Hash constants for quick access
+        v_c1_0 = v_hash_consts[0][0]
+        v_c1_2 = v_hash_consts[2][0]
+        v_c1_4 = v_hash_consts[4][0]
+        h_stage1 = HASH_STAGES[1]
+        v_c1_1, v_c3_1 = v_hash_consts[1]
+        h_stage3 = HASH_STAGES[3]
+        v_c1_3, v_c3_3 = v_hash_consts[3]
+        h_stage5 = HASH_STAGES[5]
+        v_c1_5, v_c3_5 = v_hash_consts[5]
+
+        # Prologue: Gather batch 0 (vectors 0,1,2,3) - only runs on first iteration
+        self.instrs.append({"valu": [
+            ("+", v_addr_a, all_idx[0], v_forest_p),
+            ("+", v_addr_b, all_idx[1], v_forest_p),
+            ("+", v_addr_c, all_idx[2], v_forest_p),
+            ("+", v_addr_d, all_idx[3], v_forest_p),
+        ]})
+        # 16 gather cycles for 4 vectors
+        for vec_i, (nv, addr) in enumerate([(v_node_val_a, v_addr_a), (v_node_val_b, v_addr_b),
+                                             (v_node_val_c, v_addr_c), (v_node_val_d, v_addr_d)]):
+            for i in range(0, VLEN, 2):
+                self.instrs.append({"load": [
+                    ("load_offset", nv, addr, i),
+                    ("load_offset", nv, addr, i + 1),
+                ]})
+
+        # Loop start is AFTER prologue - subsequent iterations skip the prologue
+        # because the epilogue pre-gathers for the next round
         outer_loop_start = len(self.instrs)
 
-        # PIPELINED INNER LOOP
-        # Overlap gather of batch N with hash/index computation of batch N-1
+        # Steady state: batches 1 to NUM_BATCHES_4-1
+        for batch in range(1, NUM_BATCHES_4):
+            # Previous batch vector indices
+            prev_base = (batch - 1) * 4
+            v_idx_prev = [all_idx[prev_base + j] for j in range(4)]
+            v_val_prev = [all_val[prev_base + j] for j in range(4)]
 
-        # Prologue: Gather batch 0
-        ia0, ib0 = 0, 1
-        self.instrs.append({"valu": [
-            ("+", v_addr_a, all_idx[ia0], v_forest_p),
-            ("+", v_addr_b, all_idx[ib0], v_forest_p),
-        ]})
-        for i in range(0, VLEN, 2):
-            self.instrs.append({"load": [
-                ("load_offset", v_node_val_a, v_addr_a, i),
-                ("load_offset", v_node_val_a, v_addr_a, i + 1),
-            ]})
-        for i in range(0, VLEN, 2):
-            self.instrs.append({"load": [
-                ("load_offset", v_node_val_b, v_addr_b, i),
-                ("load_offset", v_node_val_b, v_addr_b, i + 1),
-            ]})
+            # Current batch vector indices
+            cur_base = batch * 4
+            v_idx_cur = [all_idx[cur_base + j] for j in range(4)]
 
-        # Steady state: batches 1 to NUM_BATCHES-1
-        for batch in range(1, NUM_BATCHES):
-            # Previous batch indices
-            ia_prev, ib_prev = (batch - 1) * 2, (batch - 1) * 2 + 1
-            v_idx_prev_a, v_val_prev_a = all_idx[ia_prev], all_val[ia_prev]
-            v_idx_prev_b, v_val_prev_b = all_idx[ib_prev], all_val[ib_prev]
-
-            # Current batch indices
-            ia_cur, ib_cur = batch * 2, batch * 2 + 1
-            v_idx_cur_a, v_val_cur_a = all_idx[ia_cur], all_val[ia_cur]
-            v_idx_cur_b, v_val_cur_b = all_idx[ib_cur], all_val[ib_cur]
-
-            # Alternate node_val registers for double buffering
+            # Double buffering: alternate between two sets of registers
             if batch % 2 == 1:
-                nv_a, nv_b = v_node_val_a2, v_node_val_b2
-                nv_a_prev, nv_b_prev = v_node_val_a, v_node_val_b
-                addr_cur_a, addr_cur_b = v_addr_a2, v_addr_b2
+                nv_cur = [v_node_val_a2, v_node_val_b2, v_node_val_c2, v_node_val_d2]
+                nv_prev = [v_node_val_a, v_node_val_b, v_node_val_c, v_node_val_d]
+                addr_cur = [v_addr_a2, v_addr_b2, v_addr_c2, v_addr_d2]
             else:
-                nv_a, nv_b = v_node_val_a, v_node_val_b
-                nv_a_prev, nv_b_prev = v_node_val_a2, v_node_val_b2
-                addr_cur_a, addr_cur_b = v_addr_a, v_addr_b
+                nv_cur = [v_node_val_a, v_node_val_b, v_node_val_c, v_node_val_d]
+                nv_prev = [v_node_val_a2, v_node_val_b2, v_node_val_c2, v_node_val_d2]
+                addr_cur = [v_addr_a, v_addr_b, v_addr_c, v_addr_d]
 
-            # XOR for previous batch (uses nv_a_prev, nv_b_prev)
-            # Compute addresses for current batch (can be in parallel)
+            # Cycle 1: XOR prev batch (4 ops) + compute addr for current (2 ops)
             self.instrs.append({"valu": [
-                ("^", v_val_prev_a, v_val_prev_a, nv_a_prev),
-                ("^", v_val_prev_b, v_val_prev_b, nv_b_prev),
-                ("+", addr_cur_a, v_idx_cur_a, v_forest_p),
-                ("+", addr_cur_b, v_idx_cur_b, v_forest_p),
+                ("^", v_val_prev[0], v_val_prev[0], nv_prev[0]),
+                ("^", v_val_prev[1], v_val_prev[1], nv_prev[1]),
+                ("^", v_val_prev[2], v_val_prev[2], nv_prev[2]),
+                ("^", v_val_prev[3], v_val_prev[3], nv_prev[3]),
+                ("+", addr_cur[0], v_idx_cur[0], v_forest_p),
+                ("+", addr_cur[1], v_idx_cur[1], v_forest_p),
             ]})
-
-            # Gather current batch (8 cycles) overlapped with hash stages 0-4 for previous batch
-            # Using multiply_add for stages 0, 2, 4 allows fitting more hash work in gather window
-            # Schedule:
-            # gi=0: gather A[0,1], stage 0 (multiply_add)
-            # gi=1: gather A[2,3], stage 1 part 1 (tmp1, tmp2)
-            # gi=2: gather A[4,5], stage 1 part 2 (combine)
-            # gi=3: gather A[6,7], stage 2 (multiply_add)
-            # gi=4: gather B[0,1], stage 3 part 1 (tmp1, tmp2)
-            # gi=5: gather B[2,3], stage 3 part 2 (combine)
-            # gi=6: gather B[4,5], stage 4 (multiply_add) + idx*2
-            # gi=7: gather B[6,7], stage 5 part 1 (tmp1, tmp2)
-
-            v_c1_0 = v_hash_consts[0][0]
-            v_c1_2 = v_hash_consts[2][0]
-            v_c1_4 = v_hash_consts[4][0]
-            h_stage1 = HASH_STAGES[1]
-            v_c1_1, v_c3_1 = v_hash_consts[1]
-            h_stage3 = HASH_STAGES[3]
-            v_c1_3, v_c3_3 = v_hash_consts[3]
-            h_stage5 = HASH_STAGES[5]
-            v_c1_5, v_c3_5 = v_hash_consts[5]
-
-            # gi=0: gather A[0,1], stage 0 (multiply_add)
-            self.instrs.append({"load": [
-                ("load_offset", nv_a, addr_cur_a, 0),
-                ("load_offset", nv_a, addr_cur_a, 1),
-            ], "valu": [
-                ("multiply_add", v_val_prev_a, v_val_prev_a, v_mul_4097, v_c1_0),
-                ("multiply_add", v_val_prev_b, v_val_prev_b, v_mul_4097, v_c1_0),
-            ]})
-            # gi=1: gather A[2,3], stage 1 part 1
-            self.instrs.append({"load": [
-                ("load_offset", nv_a, addr_cur_a, 2),
-                ("load_offset", nv_a, addr_cur_a, 3),
-            ], "valu": [
-                (h_stage1[0], v_tmp1_a, v_val_prev_a, v_c1_1),
-                (h_stage1[3], v_tmp2_a, v_val_prev_a, v_c3_1),
-                (h_stage1[0], v_tmp1_b, v_val_prev_b, v_c1_1),
-                (h_stage1[3], v_tmp2_b, v_val_prev_b, v_c3_1),
-            ]})
-            # gi=2: gather A[4,5], stage 1 part 2
-            self.instrs.append({"load": [
-                ("load_offset", nv_a, addr_cur_a, 4),
-                ("load_offset", nv_a, addr_cur_a, 5),
-            ], "valu": [
-                (h_stage1[2], v_val_prev_a, v_tmp1_a, v_tmp2_a),
-                (h_stage1[2], v_val_prev_b, v_tmp1_b, v_tmp2_b),
-            ]})
-            # gi=3: gather A[6,7], stage 2 (multiply_add)
-            self.instrs.append({"load": [
-                ("load_offset", nv_a, addr_cur_a, 6),
-                ("load_offset", nv_a, addr_cur_a, 7),
-            ], "valu": [
-                ("multiply_add", v_val_prev_a, v_val_prev_a, v_mul_33, v_c1_2),
-                ("multiply_add", v_val_prev_b, v_val_prev_b, v_mul_33, v_c1_2),
-            ]})
-            # gi=4: gather B[0,1], stage 3 part 1
-            self.instrs.append({"load": [
-                ("load_offset", nv_b, addr_cur_b, 0),
-                ("load_offset", nv_b, addr_cur_b, 1),
-            ], "valu": [
-                (h_stage3[0], v_tmp1_a, v_val_prev_a, v_c1_3),
-                (h_stage3[3], v_tmp2_a, v_val_prev_a, v_c3_3),
-                (h_stage3[0], v_tmp1_b, v_val_prev_b, v_c1_3),
-                (h_stage3[3], v_tmp2_b, v_val_prev_b, v_c3_3),
-            ]})
-            # gi=5: gather B[2,3], stage 3 part 2
-            self.instrs.append({"load": [
-                ("load_offset", nv_b, addr_cur_b, 2),
-                ("load_offset", nv_b, addr_cur_b, 3),
-            ], "valu": [
-                (h_stage3[2], v_val_prev_a, v_tmp1_a, v_tmp2_a),
-                (h_stage3[2], v_val_prev_b, v_tmp1_b, v_tmp2_b),
-            ]})
-            # gi=6: gather B[4,5], stage 4 (multiply_add) + idx*2
-            self.instrs.append({"load": [
-                ("load_offset", nv_b, addr_cur_b, 4),
-                ("load_offset", nv_b, addr_cur_b, 5),
-            ], "valu": [
-                ("multiply_add", v_val_prev_a, v_val_prev_a, v_mul_9, v_c1_4),
-                ("multiply_add", v_val_prev_b, v_val_prev_b, v_mul_9, v_c1_4),
-                ("multiply_add", v_idx_prev_a, v_idx_prev_a, v_two, v_one),  # idx*2+1
-                ("multiply_add", v_idx_prev_b, v_idx_prev_b, v_two, v_one),
-            ]})
-            # gi=7: gather B[6,7], stage 5 part 1
-            self.instrs.append({"load": [
-                ("load_offset", nv_b, addr_cur_b, 6),
-                ("load_offset", nv_b, addr_cur_b, 7),
-            ], "valu": [
-                (h_stage5[0], v_tmp1_a, v_val_prev_a, v_c1_5),
-                (h_stage5[3], v_tmp2_a, v_val_prev_a, v_c3_5),
-                (h_stage5[0], v_tmp1_b, v_val_prev_b, v_c1_5),
-                (h_stage5[3], v_tmp2_b, v_val_prev_b, v_c3_5),
-            ]})
-
-            # Stage 5 part 2 (no longer overlapped with gather)
+            # Cycle 2: remaining addr (2 ops) + stage 0 (4 ops = multiply_add for a,b,c,d)
             self.instrs.append({"valu": [
-                (h_stage5[2], v_val_prev_a, v_tmp1_a, v_tmp2_a),
-                (h_stage5[2], v_val_prev_b, v_tmp1_b, v_tmp2_b),
+                ("+", addr_cur[2], v_idx_cur[2], v_forest_p),
+                ("+", addr_cur[3], v_idx_cur[3], v_forest_p),
+                ("multiply_add", v_val_prev[0], v_val_prev[0], v_mul_4097, v_c1_0),
+                ("multiply_add", v_val_prev[1], v_val_prev[1], v_mul_4097, v_c1_0),
+                ("multiply_add", v_val_prev[2], v_val_prev[2], v_mul_4097, v_c1_0),
+                ("multiply_add", v_val_prev[3], v_val_prev[3], v_mul_4097, v_c1_0),
             ]})
 
-            # Index computation (idx*2+1 already done above, just add mask)
-            self.instrs.append({"valu": [
-                ("&", v_tmp1_a, v_val_prev_a, v_one),
-                ("&", v_tmp1_b, v_val_prev_b, v_one),
+            # Gather current batch (16 cycles) with overlapped hash/index for prev batch
+            # gi=0: gather A[0,1], stage 1a (tmp1,tmp2 for a,b)
+            self.instrs.append({"load": [
+                ("load_offset", nv_cur[0], addr_cur[0], 0),
+                ("load_offset", nv_cur[0], addr_cur[0], 1),
+            ], "valu": [
+                (h_stage1[0], v_tmp1_a, v_val_prev[0], v_c1_1),
+                (h_stage1[3], v_tmp2_a, v_val_prev[0], v_c3_1),
+                (h_stage1[0], v_tmp1_b, v_val_prev[1], v_c1_1),
+                (h_stage1[3], v_tmp2_b, v_val_prev[1], v_c3_1),
             ]})
-            self.instrs.append({"valu": [
-                ("+", v_idx_prev_a, v_idx_prev_a, v_tmp1_a), ("+", v_idx_prev_b, v_idx_prev_b, v_tmp1_b),
+            # gi=1: gather A[2,3], stage 1a (tmp1,tmp2 for c,d)
+            self.instrs.append({"load": [
+                ("load_offset", nv_cur[0], addr_cur[0], 2),
+                ("load_offset", nv_cur[0], addr_cur[0], 3),
+            ], "valu": [
+                (h_stage1[0], v_tmp1_c, v_val_prev[2], v_c1_1),
+                (h_stage1[3], v_tmp2_c, v_val_prev[2], v_c3_1),
+                (h_stage1[0], v_tmp1_d, v_val_prev[3], v_c1_1),
+                (h_stage1[3], v_tmp2_d, v_val_prev[3], v_c3_1),
             ]})
-            self.instrs.append({"valu": [
-                ("<", v_tmp1_a, v_idx_prev_a, v_n_nodes), ("<", v_tmp1_b, v_idx_prev_b, v_n_nodes),
+            # gi=2: gather A[4,5], stage 1b (combine all 4)
+            self.instrs.append({"load": [
+                ("load_offset", nv_cur[0], addr_cur[0], 4),
+                ("load_offset", nv_cur[0], addr_cur[0], 5),
+            ], "valu": [
+                (h_stage1[2], v_val_prev[0], v_tmp1_a, v_tmp2_a),
+                (h_stage1[2], v_val_prev[1], v_tmp1_b, v_tmp2_b),
+                (h_stage1[2], v_val_prev[2], v_tmp1_c, v_tmp2_c),
+                (h_stage1[2], v_val_prev[3], v_tmp1_d, v_tmp2_d),
             ]})
-            self.instrs.append({"valu": [
-                ("*", v_idx_prev_a, v_idx_prev_a, v_tmp1_a), ("*", v_idx_prev_b, v_idx_prev_b, v_tmp1_b),
+            # gi=3: gather A[6,7], stage 2 (multiply_add for all 4)
+            self.instrs.append({"load": [
+                ("load_offset", nv_cur[0], addr_cur[0], 6),
+                ("load_offset", nv_cur[0], addr_cur[0], 7),
+            ], "valu": [
+                ("multiply_add", v_val_prev[0], v_val_prev[0], v_mul_33, v_c1_2),
+                ("multiply_add", v_val_prev[1], v_val_prev[1], v_mul_33, v_c1_2),
+                ("multiply_add", v_val_prev[2], v_val_prev[2], v_mul_33, v_c1_2),
+                ("multiply_add", v_val_prev[3], v_val_prev[3], v_mul_33, v_c1_2),
+            ]})
+            # gi=4: gather B[0,1], stage 3a (tmp1,tmp2 for a,b)
+            self.instrs.append({"load": [
+                ("load_offset", nv_cur[1], addr_cur[1], 0),
+                ("load_offset", nv_cur[1], addr_cur[1], 1),
+            ], "valu": [
+                (h_stage3[0], v_tmp1_a, v_val_prev[0], v_c1_3),
+                (h_stage3[3], v_tmp2_a, v_val_prev[0], v_c3_3),
+                (h_stage3[0], v_tmp1_b, v_val_prev[1], v_c1_3),
+                (h_stage3[3], v_tmp2_b, v_val_prev[1], v_c3_3),
+            ]})
+            # gi=5: gather B[2,3], stage 3a (tmp1,tmp2 for c,d)
+            self.instrs.append({"load": [
+                ("load_offset", nv_cur[1], addr_cur[1], 2),
+                ("load_offset", nv_cur[1], addr_cur[1], 3),
+            ], "valu": [
+                (h_stage3[0], v_tmp1_c, v_val_prev[2], v_c1_3),
+                (h_stage3[3], v_tmp2_c, v_val_prev[2], v_c3_3),
+                (h_stage3[0], v_tmp1_d, v_val_prev[3], v_c1_3),
+                (h_stage3[3], v_tmp2_d, v_val_prev[3], v_c3_3),
+            ]})
+            # gi=6: gather B[4,5], stage 3b (combine all 4)
+            self.instrs.append({"load": [
+                ("load_offset", nv_cur[1], addr_cur[1], 4),
+                ("load_offset", nv_cur[1], addr_cur[1], 5),
+            ], "valu": [
+                (h_stage3[2], v_val_prev[0], v_tmp1_a, v_tmp2_a),
+                (h_stage3[2], v_val_prev[1], v_tmp1_b, v_tmp2_b),
+                (h_stage3[2], v_val_prev[2], v_tmp1_c, v_tmp2_c),
+                (h_stage3[2], v_val_prev[3], v_tmp1_d, v_tmp2_d),
+            ]})
+            # gi=7: gather B[6,7], stage 4 (multiply_add for all 4)
+            self.instrs.append({"load": [
+                ("load_offset", nv_cur[1], addr_cur[1], 6),
+                ("load_offset", nv_cur[1], addr_cur[1], 7),
+            ], "valu": [
+                ("multiply_add", v_val_prev[0], v_val_prev[0], v_mul_9, v_c1_4),
+                ("multiply_add", v_val_prev[1], v_val_prev[1], v_mul_9, v_c1_4),
+                ("multiply_add", v_val_prev[2], v_val_prev[2], v_mul_9, v_c1_4),
+                ("multiply_add", v_val_prev[3], v_val_prev[3], v_mul_9, v_c1_4),
+            ]})
+            # gi=8: gather C[0,1], stage 5a (tmp1,tmp2 for a,b)
+            self.instrs.append({"load": [
+                ("load_offset", nv_cur[2], addr_cur[2], 0),
+                ("load_offset", nv_cur[2], addr_cur[2], 1),
+            ], "valu": [
+                (h_stage5[0], v_tmp1_a, v_val_prev[0], v_c1_5),
+                (h_stage5[3], v_tmp2_a, v_val_prev[0], v_c3_5),
+                (h_stage5[0], v_tmp1_b, v_val_prev[1], v_c1_5),
+                (h_stage5[3], v_tmp2_b, v_val_prev[1], v_c3_5),
+            ]})
+            # gi=9: gather C[2,3], stage 5a (tmp1,tmp2 for c,d)
+            self.instrs.append({"load": [
+                ("load_offset", nv_cur[2], addr_cur[2], 2),
+                ("load_offset", nv_cur[2], addr_cur[2], 3),
+            ], "valu": [
+                (h_stage5[0], v_tmp1_c, v_val_prev[2], v_c1_5),
+                (h_stage5[3], v_tmp2_c, v_val_prev[2], v_c3_5),
+                (h_stage5[0], v_tmp1_d, v_val_prev[3], v_c1_5),
+                (h_stage5[3], v_tmp2_d, v_val_prev[3], v_c3_5),
+            ]})
+            # gi=10: gather C[4,5], stage 5b (combine all 4)
+            self.instrs.append({"load": [
+                ("load_offset", nv_cur[2], addr_cur[2], 4),
+                ("load_offset", nv_cur[2], addr_cur[2], 5),
+            ], "valu": [
+                (h_stage5[2], v_val_prev[0], v_tmp1_a, v_tmp2_a),
+                (h_stage5[2], v_val_prev[1], v_tmp1_b, v_tmp2_b),
+                (h_stage5[2], v_val_prev[2], v_tmp1_c, v_tmp2_c),
+                (h_stage5[2], v_val_prev[3], v_tmp1_d, v_tmp2_d),
+            ]})
+            # gi=11: gather C[6,7], idx*2+1 (multiply_add for all 4)
+            self.instrs.append({"load": [
+                ("load_offset", nv_cur[2], addr_cur[2], 6),
+                ("load_offset", nv_cur[2], addr_cur[2], 7),
+            ], "valu": [
+                ("multiply_add", v_idx_prev[0], v_idx_prev[0], v_two, v_one),
+                ("multiply_add", v_idx_prev[1], v_idx_prev[1], v_two, v_one),
+                ("multiply_add", v_idx_prev[2], v_idx_prev[2], v_two, v_one),
+                ("multiply_add", v_idx_prev[3], v_idx_prev[3], v_two, v_one),
+            ]})
+            # gi=12: gather D[0,1], val&1 (for all 4)
+            self.instrs.append({"load": [
+                ("load_offset", nv_cur[3], addr_cur[3], 0),
+                ("load_offset", nv_cur[3], addr_cur[3], 1),
+            ], "valu": [
+                ("&", v_tmp1_a, v_val_prev[0], v_one),
+                ("&", v_tmp1_b, v_val_prev[1], v_one),
+                ("&", v_tmp1_c, v_val_prev[2], v_one),
+                ("&", v_tmp1_d, v_val_prev[3], v_one),
+            ]})
+            # gi=13: gather D[2,3], idx += mask (for all 4)
+            self.instrs.append({"load": [
+                ("load_offset", nv_cur[3], addr_cur[3], 2),
+                ("load_offset", nv_cur[3], addr_cur[3], 3),
+            ], "valu": [
+                ("+", v_idx_prev[0], v_idx_prev[0], v_tmp1_a),
+                ("+", v_idx_prev[1], v_idx_prev[1], v_tmp1_b),
+                ("+", v_idx_prev[2], v_idx_prev[2], v_tmp1_c),
+                ("+", v_idx_prev[3], v_idx_prev[3], v_tmp1_d),
+            ]})
+            # gi=14: gather D[4,5], idx < n_nodes (for all 4)
+            self.instrs.append({"load": [
+                ("load_offset", nv_cur[3], addr_cur[3], 4),
+                ("load_offset", nv_cur[3], addr_cur[3], 5),
+            ], "valu": [
+                ("<", v_tmp1_a, v_idx_prev[0], v_n_nodes),
+                ("<", v_tmp1_b, v_idx_prev[1], v_n_nodes),
+                ("<", v_tmp1_c, v_idx_prev[2], v_n_nodes),
+                ("<", v_tmp1_d, v_idx_prev[3], v_n_nodes),
+            ]})
+            # gi=15: gather D[6,7], idx *= cmp (for all 4)
+            self.instrs.append({"load": [
+                ("load_offset", nv_cur[3], addr_cur[3], 6),
+                ("load_offset", nv_cur[3], addr_cur[3], 7),
+            ], "valu": [
+                ("*", v_idx_prev[0], v_idx_prev[0], v_tmp1_a),
+                ("*", v_idx_prev[1], v_idx_prev[1], v_tmp1_b),
+                ("*", v_idx_prev[2], v_idx_prev[2], v_tmp1_c),
+                ("*", v_idx_prev[3], v_idx_prev[3], v_tmp1_d),
             ]})
 
-        # Epilogue: Process last batch (NUM_BATCHES-1)
-        ia_last, ib_last = (NUM_BATCHES - 1) * 2, (NUM_BATCHES - 1) * 2 + 1
-        v_idx_last_a, v_val_last_a = all_idx[ia_last], all_val[ia_last]
-        v_idx_last_b, v_val_last_b = all_idx[ib_last], all_val[ib_last]
-        if (NUM_BATCHES - 1) % 2 == 1:
-            nv_last_a, nv_last_b = v_node_val_a2, v_node_val_b2
+        # Epilogue: Process last batch (NUM_BATCHES_4-1) with overlapped next-round gather
+        # This overlaps the epilogue hash/index computation with gathering for the next round
+        last_base = (NUM_BATCHES_4 - 1) * 4
+        v_idx_last = [all_idx[last_base + j] for j in range(4)]
+        v_val_last = [all_val[last_base + j] for j in range(4)]
+        if (NUM_BATCHES_4 - 1) % 2 == 1:
+            nv_last = [v_node_val_a2, v_node_val_b2, v_node_val_c2, v_node_val_d2]
         else:
-            nv_last_a, nv_last_b = v_node_val_a, v_node_val_b
+            nv_last = [v_node_val_a, v_node_val_b, v_node_val_c, v_node_val_d]
 
+        # For next round's prologue, we'll gather into the OTHER set of registers
+        if (NUM_BATCHES_4 - 1) % 2 == 1:
+            nv_next = [v_node_val_a, v_node_val_b, v_node_val_c, v_node_val_d]
+            addr_next = [v_addr_a, v_addr_b, v_addr_c, v_addr_d]
+        else:
+            nv_next = [v_node_val_a2, v_node_val_b2, v_node_val_c2, v_node_val_d2]
+            addr_next = [v_addr_a2, v_addr_b2, v_addr_c2, v_addr_d2]
+
+        # XOR + compute addresses for next round's batch 0
         self.instrs.append({"valu": [
-            ("^", v_val_last_a, v_val_last_a, nv_last_a),
-            ("^", v_val_last_b, v_val_last_b, nv_last_b),
+            ("^", v_val_last[0], v_val_last[0], nv_last[0]),
+            ("^", v_val_last[1], v_val_last[1], nv_last[1]),
+            ("^", v_val_last[2], v_val_last[2], nv_last[2]),
+            ("^", v_val_last[3], v_val_last[3], nv_last[3]),
+            ("+", addr_next[0], all_idx[0], v_forest_p),
+            ("+", addr_next[1], all_idx[1], v_forest_p),
         ]})
-        # Hash (6 stages) - use multiply_add for stages 0, 2, 4
-        for hi, (op1, val1, op2, op3, val3) in enumerate(HASH_STAGES):
-            v_c1, v_c3 = v_hash_consts[hi]
-            if hi in mul_add_stages:
-                v_mul = mul_add_stages[hi]
-                self.instrs.append({"valu": [
-                    ("multiply_add", v_val_last_a, v_val_last_a, v_mul, v_c1),
-                    ("multiply_add", v_val_last_b, v_val_last_b, v_mul, v_c1),
-                ]})
-            else:
-                self.instrs.append({"valu": [
-                    (op1, v_tmp1_a, v_val_last_a, v_c1), (op3, v_tmp2_a, v_val_last_a, v_c3),
-                    (op1, v_tmp1_b, v_val_last_b, v_c1), (op3, v_tmp2_b, v_val_last_b, v_c3),
-                ]})
-                self.instrs.append({"valu": [
-                    (op2, v_val_last_a, v_tmp1_a, v_tmp2_a),
-                    (op2, v_val_last_b, v_tmp1_b, v_tmp2_b),
-                ]})
+        # Hash stage 0 + remaining addresses
         self.instrs.append({"valu": [
-            ("&", v_tmp1_a, v_val_last_a, v_one), ("multiply_add", v_idx_last_a, v_idx_last_a, v_two, v_one),
-            ("&", v_tmp1_b, v_val_last_b, v_one), ("multiply_add", v_idx_last_b, v_idx_last_b, v_two, v_one),
+            ("multiply_add", v_val_last[0], v_val_last[0], v_mul_4097, v_c1_0),
+            ("multiply_add", v_val_last[1], v_val_last[1], v_mul_4097, v_c1_0),
+            ("multiply_add", v_val_last[2], v_val_last[2], v_mul_4097, v_c1_0),
+            ("multiply_add", v_val_last[3], v_val_last[3], v_mul_4097, v_c1_0),
+            ("+", addr_next[2], all_idx[2], v_forest_p),
+            ("+", addr_next[3], all_idx[3], v_forest_p),
         ]})
-        self.instrs.append({"valu": [
-            ("+", v_idx_last_a, v_idx_last_a, v_tmp1_a), ("+", v_idx_last_b, v_idx_last_b, v_tmp1_b),
+        # Now overlap hash stages 1-5 and index with 16 gather cycles for next round
+        # gi=0: gather A[0,1], stage 1a (part 1)
+        self.instrs.append({"load": [
+            ("load_offset", nv_next[0], addr_next[0], 0),
+            ("load_offset", nv_next[0], addr_next[0], 1),
+        ], "valu": [
+            (h_stage1[0], v_tmp1_a, v_val_last[0], v_c1_1),
+            (h_stage1[3], v_tmp2_a, v_val_last[0], v_c3_1),
+            (h_stage1[0], v_tmp1_b, v_val_last[1], v_c1_1),
+            (h_stage1[3], v_tmp2_b, v_val_last[1], v_c3_1),
         ]})
-        # Merge loop control with epilogue index computation
-        self.instrs.append({"valu": [
-            ("<", v_tmp1_a, v_idx_last_a, v_n_nodes), ("<", v_tmp1_b, v_idx_last_b, v_n_nodes),
+        # gi=1: gather A[2,3], stage 1a (part 2)
+        self.instrs.append({"load": [
+            ("load_offset", nv_next[0], addr_next[0], 2),
+            ("load_offset", nv_next[0], addr_next[0], 3),
+        ], "valu": [
+            (h_stage1[0], v_tmp1_c, v_val_last[2], v_c1_1),
+            (h_stage1[3], v_tmp2_c, v_val_last[2], v_c3_1),
+            (h_stage1[0], v_tmp1_d, v_val_last[3], v_c1_1),
+            (h_stage1[3], v_tmp2_d, v_val_last[3], v_c3_1),
+        ]})
+        # gi=2: gather A[4,5], stage 1b (combine)
+        self.instrs.append({"load": [
+            ("load_offset", nv_next[0], addr_next[0], 4),
+            ("load_offset", nv_next[0], addr_next[0], 5),
+        ], "valu": [
+            (h_stage1[2], v_val_last[0], v_tmp1_a, v_tmp2_a),
+            (h_stage1[2], v_val_last[1], v_tmp1_b, v_tmp2_b),
+            (h_stage1[2], v_val_last[2], v_tmp1_c, v_tmp2_c),
+            (h_stage1[2], v_val_last[3], v_tmp1_d, v_tmp2_d),
+        ]})
+        # gi=3: gather A[6,7], stage 2
+        self.instrs.append({"load": [
+            ("load_offset", nv_next[0], addr_next[0], 6),
+            ("load_offset", nv_next[0], addr_next[0], 7),
+        ], "valu": [
+            ("multiply_add", v_val_last[0], v_val_last[0], v_mul_33, v_c1_2),
+            ("multiply_add", v_val_last[1], v_val_last[1], v_mul_33, v_c1_2),
+            ("multiply_add", v_val_last[2], v_val_last[2], v_mul_33, v_c1_2),
+            ("multiply_add", v_val_last[3], v_val_last[3], v_mul_33, v_c1_2),
+        ]})
+        # gi=4: gather B[0,1], stage 3a (part 1)
+        self.instrs.append({"load": [
+            ("load_offset", nv_next[1], addr_next[1], 0),
+            ("load_offset", nv_next[1], addr_next[1], 1),
+        ], "valu": [
+            (h_stage3[0], v_tmp1_a, v_val_last[0], v_c1_3),
+            (h_stage3[3], v_tmp2_a, v_val_last[0], v_c3_3),
+            (h_stage3[0], v_tmp1_b, v_val_last[1], v_c1_3),
+            (h_stage3[3], v_tmp2_b, v_val_last[1], v_c3_3),
+        ]})
+        # gi=5: gather B[2,3], stage 3a (part 2)
+        self.instrs.append({"load": [
+            ("load_offset", nv_next[1], addr_next[1], 2),
+            ("load_offset", nv_next[1], addr_next[1], 3),
+        ], "valu": [
+            (h_stage3[0], v_tmp1_c, v_val_last[2], v_c1_3),
+            (h_stage3[3], v_tmp2_c, v_val_last[2], v_c3_3),
+            (h_stage3[0], v_tmp1_d, v_val_last[3], v_c1_3),
+            (h_stage3[3], v_tmp2_d, v_val_last[3], v_c3_3),
+        ]})
+        # gi=6: gather B[4,5], stage 3b (combine)
+        self.instrs.append({"load": [
+            ("load_offset", nv_next[1], addr_next[1], 4),
+            ("load_offset", nv_next[1], addr_next[1], 5),
+        ], "valu": [
+            (h_stage3[2], v_val_last[0], v_tmp1_a, v_tmp2_a),
+            (h_stage3[2], v_val_last[1], v_tmp1_b, v_tmp2_b),
+            (h_stage3[2], v_val_last[2], v_tmp1_c, v_tmp2_c),
+            (h_stage3[2], v_val_last[3], v_tmp1_d, v_tmp2_d),
+        ]})
+        # gi=7: gather B[6,7], stage 4
+        self.instrs.append({"load": [
+            ("load_offset", nv_next[1], addr_next[1], 6),
+            ("load_offset", nv_next[1], addr_next[1], 7),
+        ], "valu": [
+            ("multiply_add", v_val_last[0], v_val_last[0], v_mul_9, v_c1_4),
+            ("multiply_add", v_val_last[1], v_val_last[1], v_mul_9, v_c1_4),
+            ("multiply_add", v_val_last[2], v_val_last[2], v_mul_9, v_c1_4),
+            ("multiply_add", v_val_last[3], v_val_last[3], v_mul_9, v_c1_4),
+        ]})
+        # gi=8: gather C[0,1], stage 5a (part 1)
+        self.instrs.append({"load": [
+            ("load_offset", nv_next[2], addr_next[2], 0),
+            ("load_offset", nv_next[2], addr_next[2], 1),
+        ], "valu": [
+            (h_stage5[0], v_tmp1_a, v_val_last[0], v_c1_5),
+            (h_stage5[3], v_tmp2_a, v_val_last[0], v_c3_5),
+            (h_stage5[0], v_tmp1_b, v_val_last[1], v_c1_5),
+            (h_stage5[3], v_tmp2_b, v_val_last[1], v_c3_5),
+        ]})
+        # gi=9: gather C[2,3], stage 5a (part 2)
+        self.instrs.append({"load": [
+            ("load_offset", nv_next[2], addr_next[2], 2),
+            ("load_offset", nv_next[2], addr_next[2], 3),
+        ], "valu": [
+            (h_stage5[0], v_tmp1_c, v_val_last[2], v_c1_5),
+            (h_stage5[3], v_tmp2_c, v_val_last[2], v_c3_5),
+            (h_stage5[0], v_tmp1_d, v_val_last[3], v_c1_5),
+            (h_stage5[3], v_tmp2_d, v_val_last[3], v_c3_5),
+        ]})
+        # gi=10: gather C[4,5], stage 5b (combine)
+        self.instrs.append({"load": [
+            ("load_offset", nv_next[2], addr_next[2], 4),
+            ("load_offset", nv_next[2], addr_next[2], 5),
+        ], "valu": [
+            (h_stage5[2], v_val_last[0], v_tmp1_a, v_tmp2_a),
+            (h_stage5[2], v_val_last[1], v_tmp1_b, v_tmp2_b),
+            (h_stage5[2], v_val_last[2], v_tmp1_c, v_tmp2_c),
+            (h_stage5[2], v_val_last[3], v_tmp1_d, v_tmp2_d),
+        ]})
+        # gi=11: gather C[6,7], idx*2+1
+        self.instrs.append({"load": [
+            ("load_offset", nv_next[2], addr_next[2], 6),
+            ("load_offset", nv_next[2], addr_next[2], 7),
+        ], "valu": [
+            ("multiply_add", v_idx_last[0], v_idx_last[0], v_two, v_one),
+            ("multiply_add", v_idx_last[1], v_idx_last[1], v_two, v_one),
+            ("multiply_add", v_idx_last[2], v_idx_last[2], v_two, v_one),
+            ("multiply_add", v_idx_last[3], v_idx_last[3], v_two, v_one),
+        ]})
+        # gi=12: gather D[0,1], val&1
+        self.instrs.append({"load": [
+            ("load_offset", nv_next[3], addr_next[3], 0),
+            ("load_offset", nv_next[3], addr_next[3], 1),
+        ], "valu": [
+            ("&", v_tmp1_a, v_val_last[0], v_one),
+            ("&", v_tmp1_b, v_val_last[1], v_one),
+            ("&", v_tmp1_c, v_val_last[2], v_one),
+            ("&", v_tmp1_d, v_val_last[3], v_one),
+        ]})
+        # gi=13: gather D[2,3], idx += mask
+        self.instrs.append({"load": [
+            ("load_offset", nv_next[3], addr_next[3], 2),
+            ("load_offset", nv_next[3], addr_next[3], 3),
+        ], "valu": [
+            ("+", v_idx_last[0], v_idx_last[0], v_tmp1_a),
+            ("+", v_idx_last[1], v_idx_last[1], v_tmp1_b),
+            ("+", v_idx_last[2], v_idx_last[2], v_tmp1_c),
+            ("+", v_idx_last[3], v_idx_last[3], v_tmp1_d),
+        ]})
+        # gi=14: gather D[4,5], idx < n_nodes
+        self.instrs.append({"load": [
+            ("load_offset", nv_next[3], addr_next[3], 4),
+            ("load_offset", nv_next[3], addr_next[3], 5),
+        ], "valu": [
+            ("<", v_tmp1_a, v_idx_last[0], v_n_nodes),
+            ("<", v_tmp1_b, v_idx_last[1], v_n_nodes),
+            ("<", v_tmp1_c, v_idx_last[2], v_n_nodes),
+            ("<", v_tmp1_d, v_idx_last[3], v_n_nodes),
         ], "alu": [("+", round_counter, round_counter, one_const)]})
-        self.instrs.append({"valu": [
-            ("*", v_idx_last_a, v_idx_last_a, v_tmp1_a), ("*", v_idx_last_b, v_idx_last_b, v_tmp1_b),
+        # gi=15: gather D[6,7], idx *= cmp + loop control
+        self.instrs.append({"load": [
+            ("load_offset", nv_next[3], addr_next[3], 6),
+            ("load_offset", nv_next[3], addr_next[3], 7),
+        ], "valu": [
+            ("*", v_idx_last[0], v_idx_last[0], v_tmp1_a),
+            ("*", v_idx_last[1], v_idx_last[1], v_tmp1_b),
+            ("*", v_idx_last[2], v_idx_last[2], v_tmp1_c),
+            ("*", v_idx_last[3], v_idx_last[3], v_tmp1_d),
         ], "alu": [("<", loop_cond, round_counter, eleven_const)]})
         self.instrs.append({"flow": [("cond_jump", loop_cond, outer_loop_start)]})
 
@@ -878,10 +1129,13 @@ class KernelBuilder:
         self.instrs.append({"load": [("load", tree1_scalar, addr_tmp)]})
         self.instrs.append({"alu": [("+", addr_tmp, self.scratch["forest_values_p"], two_const)]})
         self.instrs.append({"load": [("load", tree2_scalar, addr_tmp)]})
+        # Compute diff and c for multiply_add optimization
         self.instrs.append({"alu": [("-", diff_scalar, tree2_scalar, tree1_scalar)]})
+        self.instrs.append({"alu": [("-", c_scalar, tree1_scalar, diff_scalar)]})
         self.instrs.append({"valu": [
             ("vbroadcast", v_tree1, tree1_scalar),
             ("vbroadcast", v_diff, diff_scalar),
+            ("vbroadcast", v_c, c_scalar),
         ]})
 
         for start_vec, num_vecs in vec_batches:
@@ -889,14 +1143,9 @@ class KernelBuilder:
             tmp1_list = [v_tmp1_a, v_tmp1_b, v_tmp1_c, v_tmp1_d, v_tmp1_e, v_tmp1_f][:num_vecs]
             tmp2_list = [v_tmp2_a, v_tmp2_b, v_tmp2_c, v_tmp2_d, v_tmp2_e, v_tmp2_f][:num_vecs]
 
-            offset_ops = [("-", t1, v_idx, v_one) for (v_idx, v_val), t1 in zip(vecs, tmp1_list)]
-            self.instrs.append({"valu": offset_ops})
-
-            mul_ops = [("*", t2, t1, v_diff) for t1, t2 in zip(tmp1_list[:num_vecs], tmp2_list[:num_vecs])]
-            self.instrs.append({"valu": mul_ops})
-
-            add_node_ops = [("+", t1, v_tree1, t2) for t1, t2 in zip(tmp1_list[:num_vecs], tmp2_list[:num_vecs])]
-            self.instrs.append({"valu": add_node_ops})
+            # Compute node_val = idx * diff + c using multiply_add (3 cycles -> 1 cycle)
+            node_val_ops = [("multiply_add", t1, v_idx, v_diff, v_c) for (v_idx, v_val), t1 in zip(vecs, tmp1_list)]
+            self.instrs.append({"valu": node_val_ops})
 
             xor_ops = [("^", v_val, v_val, t1) for (v_idx, v_val), t1 in zip(vecs, tmp1_list)]
             self.instrs.append({"valu": xor_ops})
@@ -932,14 +1181,12 @@ class KernelBuilder:
                     combine_ops = [(op2, v_val, t1, t2) for (v_idx, v_val), t1, t2 in zip(vecs, tmp1_list, tmp2_list)]
                     self.instrs.append({"valu": combine_ops})
 
-            mul_idx_ops = [("*", v_idx, v_idx, v_two) for (v_idx, v_val) in vecs]
-            self.instrs.append({"valu": mul_idx_ops})
+            # Index computation: idx*2+1 + (val&1) using multiply_add
+            mul_add_idx_ops = [("multiply_add", v_idx, v_idx, v_two, v_one) for (v_idx, v_val) in vecs]
+            self.instrs.append({"valu": mul_add_idx_ops})
 
             and_ops = [("&", t1, v_val, v_one) for (v_idx, v_val), t1 in zip(vecs, tmp1_list)]
             self.instrs.append({"valu": and_ops})
-
-            add_one_ops = [("+", t1, v_one, t1) for t1 in tmp1_list[:num_vecs]]
-            self.instrs.append({"valu": add_one_ops})
 
             add_idx_ops = [("+", v_idx, v_idx, t1) for (v_idx, v_val), t1 in zip(vecs, tmp1_list)]
             self.instrs.append({"valu": add_idx_ops})
@@ -956,37 +1203,31 @@ class KernelBuilder:
         # ============================================
         # Tree values 3-6 are already loaded, just reuse v_tree3, v_tree4, v_tree5, v_tree6
 
-        # Process all vectors for round 13 using one-hot selection
+        # Process all vectors for round 13 using 2-bit selection (same as round 2)
         for start_vec, num_vecs in vec_batches:
             vecs = [(all_idx[i], all_val[i]) for i in range(start_vec, start_vec + num_vecs)]
             tmp1_list = [v_tmp1_a, v_tmp1_b, v_tmp1_c, v_tmp1_d, v_tmp1_e, v_tmp1_f][:num_vecs]
             tmp2_list = [v_tmp2_a, v_tmp2_b, v_tmp2_c, v_tmp2_d, v_tmp2_e, v_tmp2_f][:num_vecs]
+            tmp3_list = [v_tmp3_a, v_tmp3_b, v_tmp3_c, v_tmp3_d, v_tmp3_e, v_tmp3_f][:num_vecs]
 
-            # Compute masks and use multiply_add to accumulate (same as round 2)
-            eq3_ops = [("==", t1, v_idx, v_three) for (v_idx, v_val), t1 in zip(vecs, tmp1_list)]
-            self.instrs.append({"valu": eq3_ops})
+            # 2-bit selection: cmp_lt5, cmp_odd -> base_low, base_high -> diff_bases -> node_val
+            cmp_lt5_ops = [("<", t1, v_idx, v_five) for (v_idx, v_val), t1 in zip(vecs, tmp1_list)]
+            self.instrs.append({"valu": cmp_lt5_ops})
 
-            mul3_ops = [("*", t2, v_tree3, t1) for t1, t2 in zip(tmp1_list[:num_vecs], tmp2_list[:num_vecs])]
-            self.instrs.append({"valu": mul3_ops})
+            cmp_odd_ops = [("&", t2, v_idx, v_one) for (v_idx, v_val), t2 in zip(vecs, tmp2_list)]
+            self.instrs.append({"valu": cmp_odd_ops})
 
-            eq4_ops = [("==", t1, v_idx, v_four) for (v_idx, v_val), t1 in zip(vecs, tmp1_list)]
-            self.instrs.append({"valu": eq4_ops})
+            base_low_ops = [("multiply_add", t3, t2, v_diff_low, v_tree4) for t2, t3 in zip(tmp2_list[:num_vecs], tmp3_list[:num_vecs])]
+            self.instrs.append({"valu": base_low_ops})
 
-            ma4_ops = [("multiply_add", t2, v_tree4, t1, t2) for t1, t2 in zip(tmp1_list[:num_vecs], tmp2_list[:num_vecs])]
-            self.instrs.append({"valu": ma4_ops})
+            base_high_ops = [("multiply_add", t2, t2, v_diff_high, v_tree6) for t2 in tmp2_list[:num_vecs]]
+            self.instrs.append({"valu": base_high_ops})
 
-            eq5_ops = [("==", t1, v_idx, v_five) for (v_idx, v_val), t1 in zip(vecs, tmp1_list)]
-            self.instrs.append({"valu": eq5_ops})
+            diff_bases_ops = [("-", t3, t3, t2) for t2, t3 in zip(tmp2_list[:num_vecs], tmp3_list[:num_vecs])]
+            self.instrs.append({"valu": diff_bases_ops})
 
-            ma5_ops = [("multiply_add", t2, v_tree5, t1, t2) for t1, t2 in zip(tmp1_list[:num_vecs], tmp2_list[:num_vecs])]
-            self.instrs.append({"valu": ma5_ops})
-
-            eq6_ops = [("==", t1, v_idx, v_six) for (v_idx, v_val), t1 in zip(vecs, tmp1_list)]
-            self.instrs.append({"valu": eq6_ops})
-
-            ma6_ops = [("multiply_add", t1, v_tree6, t1, t2) for t1, t2 in zip(tmp1_list[:num_vecs], tmp2_list[:num_vecs])]
-            self.instrs.append({"valu": ma6_ops})
-            # Now tmp1_list[i] contains node_val for each vector
+            node_val_ops = [("multiply_add", t1, t1, t3, t2) for t1, t2, t3 in zip(tmp1_list[:num_vecs], tmp2_list[:num_vecs], tmp3_list[:num_vecs])]
+            self.instrs.append({"valu": node_val_ops})
 
             # XOR: val = val ^ node_val
             xor_ops = [("^", v_val, v_val, t1) for (v_idx, v_val), t1 in zip(vecs, tmp1_list)]
@@ -1023,15 +1264,12 @@ class KernelBuilder:
                     combine_ops = [(op2, v_val, t1, t2) for (v_idx, v_val), t1, t2 in zip(vecs, tmp1_list, tmp2_list)]
                     self.instrs.append({"valu": combine_ops})
 
-            # Index computation: new_idx = idx * 2 + (1 + (val & 1))
-            mul_idx_ops = [("*", v_idx, v_idx, v_two) for (v_idx, v_val) in vecs]
-            self.instrs.append({"valu": mul_idx_ops})
+            # Index computation: idx*2+1 + (val&1) using multiply_add
+            mul_add_idx_ops = [("multiply_add", v_idx, v_idx, v_two, v_one) for (v_idx, v_val) in vecs]
+            self.instrs.append({"valu": mul_add_idx_ops})
 
             and_ops = [("&", t1, v_val, v_one) for (v_idx, v_val), t1 in zip(vecs, tmp1_list)]
             self.instrs.append({"valu": and_ops})
-
-            add_one_ops = [("+", t1, v_one, t1) for t1 in tmp1_list[:num_vecs]]
-            self.instrs.append({"valu": add_one_ops})
 
             add_idx_ops = [("+", v_idx, v_idx, t1) for (v_idx, v_val), t1 in zip(vecs, tmp1_list)]
             self.instrs.append({"valu": add_idx_ops})
@@ -1044,202 +1282,423 @@ class KernelBuilder:
             self.instrs.append({"valu": wrap_ops})
 
         # ============================================
-        # ROUNDS 14-15: Third pipelined loop
+        # ROUNDS 14-15: 4-vector pipelined loop
         # ============================================
         self.instrs.append({"load": [("const", round_counter, 14)]})
-        outer_loop_start_2 = len(self.instrs)
 
-        # Prologue: Gather batch 0
+        # Prologue: Gather batch 0 (vectors 0,1,2,3) - only runs on first iteration
         self.instrs.append({"valu": [
             ("+", v_addr_a, all_idx[0], v_forest_p),
             ("+", v_addr_b, all_idx[1], v_forest_p),
+            ("+", v_addr_c, all_idx[2], v_forest_p),
+            ("+", v_addr_d, all_idx[3], v_forest_p),
         ]})
-        for i in range(0, VLEN, 2):
-            self.instrs.append({"load": [
-                ("load_offset", v_node_val_a, v_addr_a, i),
-                ("load_offset", v_node_val_a, v_addr_a, i + 1),
-            ]})
-        for i in range(0, VLEN, 2):
-            self.instrs.append({"load": [
-                ("load_offset", v_node_val_b, v_addr_b, i),
-                ("load_offset", v_node_val_b, v_addr_b, i + 1),
-            ]})
+        # 16 gather cycles for 4 vectors
+        for vec_i, (nv, addr) in enumerate([(v_node_val_a, v_addr_a), (v_node_val_b, v_addr_b),
+                                             (v_node_val_c, v_addr_c), (v_node_val_d, v_addr_d)]):
+            for i in range(0, VLEN, 2):
+                self.instrs.append({"load": [
+                    ("load_offset", nv, addr, i),
+                    ("load_offset", nv, addr, i + 1),
+                ]})
 
-        # Steady state
-        for batch in range(1, NUM_BATCHES):
-            ia_prev, ib_prev = (batch - 1) * 2, (batch - 1) * 2 + 1
-            v_idx_prev_a, v_val_prev_a = all_idx[ia_prev], all_val[ia_prev]
-            v_idx_prev_b, v_val_prev_b = all_idx[ib_prev], all_val[ib_prev]
+        # Loop start is AFTER prologue
+        outer_loop_start_2 = len(self.instrs)
 
-            ia_cur, ib_cur = batch * 2, batch * 2 + 1
-            v_idx_cur_a, v_val_cur_a = all_idx[ia_cur], all_val[ia_cur]
-            v_idx_cur_b, v_val_cur_b = all_idx[ib_cur], all_val[ib_cur]
+        # Steady state: batches 1 to NUM_BATCHES_4-1
+        for batch in range(1, NUM_BATCHES_4):
+            prev_base = (batch - 1) * 4
+            v_idx_prev2 = [all_idx[prev_base + j] for j in range(4)]
+            v_val_prev2 = [all_val[prev_base + j] for j in range(4)]
+
+            cur_base = batch * 4
+            v_idx_cur2 = [all_idx[cur_base + j] for j in range(4)]
 
             if batch % 2 == 1:
-                nv_a, nv_b = v_node_val_a2, v_node_val_b2
-                nv_a_prev, nv_b_prev = v_node_val_a, v_node_val_b
-                addr_cur_a, addr_cur_b = v_addr_a2, v_addr_b2
+                nv_cur2 = [v_node_val_a2, v_node_val_b2, v_node_val_c2, v_node_val_d2]
+                nv_prev2 = [v_node_val_a, v_node_val_b, v_node_val_c, v_node_val_d]
+                addr_cur2 = [v_addr_a2, v_addr_b2, v_addr_c2, v_addr_d2]
             else:
-                nv_a, nv_b = v_node_val_a, v_node_val_b
-                nv_a_prev, nv_b_prev = v_node_val_a2, v_node_val_b2
-                addr_cur_a, addr_cur_b = v_addr_a, v_addr_b
+                nv_cur2 = [v_node_val_a, v_node_val_b, v_node_val_c, v_node_val_d]
+                nv_prev2 = [v_node_val_a2, v_node_val_b2, v_node_val_c2, v_node_val_d2]
+                addr_cur2 = [v_addr_a, v_addr_b, v_addr_c, v_addr_d]
 
+            # Cycle 1: XOR prev batch (4 ops) + compute addr for current (2 ops)
             self.instrs.append({"valu": [
-                ("^", v_val_prev_a, v_val_prev_a, nv_a_prev),
-                ("^", v_val_prev_b, v_val_prev_b, nv_b_prev),
-                ("+", addr_cur_a, v_idx_cur_a, v_forest_p),
-                ("+", addr_cur_b, v_idx_cur_b, v_forest_p),
+                ("^", v_val_prev2[0], v_val_prev2[0], nv_prev2[0]),
+                ("^", v_val_prev2[1], v_val_prev2[1], nv_prev2[1]),
+                ("^", v_val_prev2[2], v_val_prev2[2], nv_prev2[2]),
+                ("^", v_val_prev2[3], v_val_prev2[3], nv_prev2[3]),
+                ("+", addr_cur2[0], v_idx_cur2[0], v_forest_p),
+                ("+", addr_cur2[1], v_idx_cur2[1], v_forest_p),
             ]})
-
-            # Restructured pipelined hash with multiply_add for stages 0, 2, 4
-            v_c1_0 = v_hash_consts[0][0]
-            v_c1_2 = v_hash_consts[2][0]
-            v_c1_4 = v_hash_consts[4][0]
-            h_stage1 = HASH_STAGES[1]
-            v_c1_1, v_c3_1 = v_hash_consts[1]
-            h_stage3 = HASH_STAGES[3]
-            v_c1_3, v_c3_3 = v_hash_consts[3]
-            h_stage5 = HASH_STAGES[5]
-            v_c1_5, v_c3_5 = v_hash_consts[5]
-
-            # gi=0: gather A[0,1], stage 0 (multiply_add)
-            self.instrs.append({"load": [
-                ("load_offset", nv_a, addr_cur_a, 0),
-                ("load_offset", nv_a, addr_cur_a, 1),
-            ], "valu": [
-                ("multiply_add", v_val_prev_a, v_val_prev_a, v_mul_4097, v_c1_0),
-                ("multiply_add", v_val_prev_b, v_val_prev_b, v_mul_4097, v_c1_0),
-            ]})
-            # gi=1: gather A[2,3], stage 1 part 1
-            self.instrs.append({"load": [
-                ("load_offset", nv_a, addr_cur_a, 2),
-                ("load_offset", nv_a, addr_cur_a, 3),
-            ], "valu": [
-                (h_stage1[0], v_tmp1_a, v_val_prev_a, v_c1_1),
-                (h_stage1[3], v_tmp2_a, v_val_prev_a, v_c3_1),
-                (h_stage1[0], v_tmp1_b, v_val_prev_b, v_c1_1),
-                (h_stage1[3], v_tmp2_b, v_val_prev_b, v_c3_1),
-            ]})
-            # gi=2: gather A[4,5], stage 1 part 2
-            self.instrs.append({"load": [
-                ("load_offset", nv_a, addr_cur_a, 4),
-                ("load_offset", nv_a, addr_cur_a, 5),
-            ], "valu": [
-                (h_stage1[2], v_val_prev_a, v_tmp1_a, v_tmp2_a),
-                (h_stage1[2], v_val_prev_b, v_tmp1_b, v_tmp2_b),
-            ]})
-            # gi=3: gather A[6,7], stage 2 (multiply_add)
-            self.instrs.append({"load": [
-                ("load_offset", nv_a, addr_cur_a, 6),
-                ("load_offset", nv_a, addr_cur_a, 7),
-            ], "valu": [
-                ("multiply_add", v_val_prev_a, v_val_prev_a, v_mul_33, v_c1_2),
-                ("multiply_add", v_val_prev_b, v_val_prev_b, v_mul_33, v_c1_2),
-            ]})
-            # gi=4: gather B[0,1], stage 3 part 1
-            self.instrs.append({"load": [
-                ("load_offset", nv_b, addr_cur_b, 0),
-                ("load_offset", nv_b, addr_cur_b, 1),
-            ], "valu": [
-                (h_stage3[0], v_tmp1_a, v_val_prev_a, v_c1_3),
-                (h_stage3[3], v_tmp2_a, v_val_prev_a, v_c3_3),
-                (h_stage3[0], v_tmp1_b, v_val_prev_b, v_c1_3),
-                (h_stage3[3], v_tmp2_b, v_val_prev_b, v_c3_3),
-            ]})
-            # gi=5: gather B[2,3], stage 3 part 2
-            self.instrs.append({"load": [
-                ("load_offset", nv_b, addr_cur_b, 2),
-                ("load_offset", nv_b, addr_cur_b, 3),
-            ], "valu": [
-                (h_stage3[2], v_val_prev_a, v_tmp1_a, v_tmp2_a),
-                (h_stage3[2], v_val_prev_b, v_tmp1_b, v_tmp2_b),
-            ]})
-            # gi=6: gather B[4,5], stage 4 (multiply_add) + idx*2+1
-            self.instrs.append({"load": [
-                ("load_offset", nv_b, addr_cur_b, 4),
-                ("load_offset", nv_b, addr_cur_b, 5),
-            ], "valu": [
-                ("multiply_add", v_val_prev_a, v_val_prev_a, v_mul_9, v_c1_4),
-                ("multiply_add", v_val_prev_b, v_val_prev_b, v_mul_9, v_c1_4),
-                ("multiply_add", v_idx_prev_a, v_idx_prev_a, v_two, v_one),  # idx*2+1
-                ("multiply_add", v_idx_prev_b, v_idx_prev_b, v_two, v_one),
-            ]})
-            # gi=7: gather B[6,7], stage 5 part 1
-            self.instrs.append({"load": [
-                ("load_offset", nv_b, addr_cur_b, 6),
-                ("load_offset", nv_b, addr_cur_b, 7),
-            ], "valu": [
-                (h_stage5[0], v_tmp1_a, v_val_prev_a, v_c1_5),
-                (h_stage5[3], v_tmp2_a, v_val_prev_a, v_c3_5),
-                (h_stage5[0], v_tmp1_b, v_val_prev_b, v_c1_5),
-                (h_stage5[3], v_tmp2_b, v_val_prev_b, v_c3_5),
+            # Cycle 2: remaining addr (2 ops) + stage 0 (4 ops)
+            self.instrs.append({"valu": [
+                ("+", addr_cur2[2], v_idx_cur2[2], v_forest_p),
+                ("+", addr_cur2[3], v_idx_cur2[3], v_forest_p),
+                ("multiply_add", v_val_prev2[0], v_val_prev2[0], v_mul_4097, v_c1_0),
+                ("multiply_add", v_val_prev2[1], v_val_prev2[1], v_mul_4097, v_c1_0),
+                ("multiply_add", v_val_prev2[2], v_val_prev2[2], v_mul_4097, v_c1_0),
+                ("multiply_add", v_val_prev2[3], v_val_prev2[3], v_mul_4097, v_c1_0),
             ]})
 
-            # Stage 5 part 2
-            self.instrs.append({"valu": [
-                (h_stage5[2], v_val_prev_a, v_tmp1_a, v_tmp2_a),
-                (h_stage5[2], v_val_prev_b, v_tmp1_b, v_tmp2_b),
+            # Gather current batch (16 cycles) with overlapped hash/index
+            # gi=0: gather A[0,1], stage 1a (tmp1,tmp2 for a,b)
+            self.instrs.append({"load": [
+                ("load_offset", nv_cur2[0], addr_cur2[0], 0),
+                ("load_offset", nv_cur2[0], addr_cur2[0], 1),
+            ], "valu": [
+                (h_stage1[0], v_tmp1_a, v_val_prev2[0], v_c1_1),
+                (h_stage1[3], v_tmp2_a, v_val_prev2[0], v_c3_1),
+                (h_stage1[0], v_tmp1_b, v_val_prev2[1], v_c1_1),
+                (h_stage1[3], v_tmp2_b, v_val_prev2[1], v_c3_1),
+            ]})
+            # gi=1: gather A[2,3], stage 1a (tmp1,tmp2 for c,d)
+            self.instrs.append({"load": [
+                ("load_offset", nv_cur2[0], addr_cur2[0], 2),
+                ("load_offset", nv_cur2[0], addr_cur2[0], 3),
+            ], "valu": [
+                (h_stage1[0], v_tmp1_c, v_val_prev2[2], v_c1_1),
+                (h_stage1[3], v_tmp2_c, v_val_prev2[2], v_c3_1),
+                (h_stage1[0], v_tmp1_d, v_val_prev2[3], v_c1_1),
+                (h_stage1[3], v_tmp2_d, v_val_prev2[3], v_c3_1),
+            ]})
+            # gi=2: gather A[4,5], stage 1b (combine all 4)
+            self.instrs.append({"load": [
+                ("load_offset", nv_cur2[0], addr_cur2[0], 4),
+                ("load_offset", nv_cur2[0], addr_cur2[0], 5),
+            ], "valu": [
+                (h_stage1[2], v_val_prev2[0], v_tmp1_a, v_tmp2_a),
+                (h_stage1[2], v_val_prev2[1], v_tmp1_b, v_tmp2_b),
+                (h_stage1[2], v_val_prev2[2], v_tmp1_c, v_tmp2_c),
+                (h_stage1[2], v_val_prev2[3], v_tmp1_d, v_tmp2_d),
+            ]})
+            # gi=3: gather A[6,7], stage 2 (multiply_add for all 4)
+            self.instrs.append({"load": [
+                ("load_offset", nv_cur2[0], addr_cur2[0], 6),
+                ("load_offset", nv_cur2[0], addr_cur2[0], 7),
+            ], "valu": [
+                ("multiply_add", v_val_prev2[0], v_val_prev2[0], v_mul_33, v_c1_2),
+                ("multiply_add", v_val_prev2[1], v_val_prev2[1], v_mul_33, v_c1_2),
+                ("multiply_add", v_val_prev2[2], v_val_prev2[2], v_mul_33, v_c1_2),
+                ("multiply_add", v_val_prev2[3], v_val_prev2[3], v_mul_33, v_c1_2),
+            ]})
+            # gi=4: gather B[0,1], stage 3a (tmp1,tmp2 for a,b)
+            self.instrs.append({"load": [
+                ("load_offset", nv_cur2[1], addr_cur2[1], 0),
+                ("load_offset", nv_cur2[1], addr_cur2[1], 1),
+            ], "valu": [
+                (h_stage3[0], v_tmp1_a, v_val_prev2[0], v_c1_3),
+                (h_stage3[3], v_tmp2_a, v_val_prev2[0], v_c3_3),
+                (h_stage3[0], v_tmp1_b, v_val_prev2[1], v_c1_3),
+                (h_stage3[3], v_tmp2_b, v_val_prev2[1], v_c3_3),
+            ]})
+            # gi=5: gather B[2,3], stage 3a (tmp1,tmp2 for c,d)
+            self.instrs.append({"load": [
+                ("load_offset", nv_cur2[1], addr_cur2[1], 2),
+                ("load_offset", nv_cur2[1], addr_cur2[1], 3),
+            ], "valu": [
+                (h_stage3[0], v_tmp1_c, v_val_prev2[2], v_c1_3),
+                (h_stage3[3], v_tmp2_c, v_val_prev2[2], v_c3_3),
+                (h_stage3[0], v_tmp1_d, v_val_prev2[3], v_c1_3),
+                (h_stage3[3], v_tmp2_d, v_val_prev2[3], v_c3_3),
+            ]})
+            # gi=6: gather B[4,5], stage 3b (combine all 4)
+            self.instrs.append({"load": [
+                ("load_offset", nv_cur2[1], addr_cur2[1], 4),
+                ("load_offset", nv_cur2[1], addr_cur2[1], 5),
+            ], "valu": [
+                (h_stage3[2], v_val_prev2[0], v_tmp1_a, v_tmp2_a),
+                (h_stage3[2], v_val_prev2[1], v_tmp1_b, v_tmp2_b),
+                (h_stage3[2], v_val_prev2[2], v_tmp1_c, v_tmp2_c),
+                (h_stage3[2], v_val_prev2[3], v_tmp1_d, v_tmp2_d),
+            ]})
+            # gi=7: gather B[6,7], stage 4 (multiply_add for all 4)
+            self.instrs.append({"load": [
+                ("load_offset", nv_cur2[1], addr_cur2[1], 6),
+                ("load_offset", nv_cur2[1], addr_cur2[1], 7),
+            ], "valu": [
+                ("multiply_add", v_val_prev2[0], v_val_prev2[0], v_mul_9, v_c1_4),
+                ("multiply_add", v_val_prev2[1], v_val_prev2[1], v_mul_9, v_c1_4),
+                ("multiply_add", v_val_prev2[2], v_val_prev2[2], v_mul_9, v_c1_4),
+                ("multiply_add", v_val_prev2[3], v_val_prev2[3], v_mul_9, v_c1_4),
+            ]})
+            # gi=8: gather C[0,1], stage 5a (tmp1,tmp2 for a,b)
+            self.instrs.append({"load": [
+                ("load_offset", nv_cur2[2], addr_cur2[2], 0),
+                ("load_offset", nv_cur2[2], addr_cur2[2], 1),
+            ], "valu": [
+                (h_stage5[0], v_tmp1_a, v_val_prev2[0], v_c1_5),
+                (h_stage5[3], v_tmp2_a, v_val_prev2[0], v_c3_5),
+                (h_stage5[0], v_tmp1_b, v_val_prev2[1], v_c1_5),
+                (h_stage5[3], v_tmp2_b, v_val_prev2[1], v_c3_5),
+            ]})
+            # gi=9: gather C[2,3], stage 5a (tmp1,tmp2 for c,d)
+            self.instrs.append({"load": [
+                ("load_offset", nv_cur2[2], addr_cur2[2], 2),
+                ("load_offset", nv_cur2[2], addr_cur2[2], 3),
+            ], "valu": [
+                (h_stage5[0], v_tmp1_c, v_val_prev2[2], v_c1_5),
+                (h_stage5[3], v_tmp2_c, v_val_prev2[2], v_c3_5),
+                (h_stage5[0], v_tmp1_d, v_val_prev2[3], v_c1_5),
+                (h_stage5[3], v_tmp2_d, v_val_prev2[3], v_c3_5),
+            ]})
+            # gi=10: gather C[4,5], stage 5b (combine all 4)
+            self.instrs.append({"load": [
+                ("load_offset", nv_cur2[2], addr_cur2[2], 4),
+                ("load_offset", nv_cur2[2], addr_cur2[2], 5),
+            ], "valu": [
+                (h_stage5[2], v_val_prev2[0], v_tmp1_a, v_tmp2_a),
+                (h_stage5[2], v_val_prev2[1], v_tmp1_b, v_tmp2_b),
+                (h_stage5[2], v_val_prev2[2], v_tmp1_c, v_tmp2_c),
+                (h_stage5[2], v_val_prev2[3], v_tmp1_d, v_tmp2_d),
+            ]})
+            # gi=11: gather C[6,7], idx*2+1 (multiply_add for all 4)
+            self.instrs.append({"load": [
+                ("load_offset", nv_cur2[2], addr_cur2[2], 6),
+                ("load_offset", nv_cur2[2], addr_cur2[2], 7),
+            ], "valu": [
+                ("multiply_add", v_idx_prev2[0], v_idx_prev2[0], v_two, v_one),
+                ("multiply_add", v_idx_prev2[1], v_idx_prev2[1], v_two, v_one),
+                ("multiply_add", v_idx_prev2[2], v_idx_prev2[2], v_two, v_one),
+                ("multiply_add", v_idx_prev2[3], v_idx_prev2[3], v_two, v_one),
+            ]})
+            # gi=12: gather D[0,1], val&1 (for all 4)
+            self.instrs.append({"load": [
+                ("load_offset", nv_cur2[3], addr_cur2[3], 0),
+                ("load_offset", nv_cur2[3], addr_cur2[3], 1),
+            ], "valu": [
+                ("&", v_tmp1_a, v_val_prev2[0], v_one),
+                ("&", v_tmp1_b, v_val_prev2[1], v_one),
+                ("&", v_tmp1_c, v_val_prev2[2], v_one),
+                ("&", v_tmp1_d, v_val_prev2[3], v_one),
+            ]})
+            # gi=13: gather D[2,3], idx += mask (for all 4)
+            self.instrs.append({"load": [
+                ("load_offset", nv_cur2[3], addr_cur2[3], 2),
+                ("load_offset", nv_cur2[3], addr_cur2[3], 3),
+            ], "valu": [
+                ("+", v_idx_prev2[0], v_idx_prev2[0], v_tmp1_a),
+                ("+", v_idx_prev2[1], v_idx_prev2[1], v_tmp1_b),
+                ("+", v_idx_prev2[2], v_idx_prev2[2], v_tmp1_c),
+                ("+", v_idx_prev2[3], v_idx_prev2[3], v_tmp1_d),
+            ]})
+            # gi=14: gather D[4,5], idx < n_nodes (for all 4)
+            self.instrs.append({"load": [
+                ("load_offset", nv_cur2[3], addr_cur2[3], 4),
+                ("load_offset", nv_cur2[3], addr_cur2[3], 5),
+            ], "valu": [
+                ("<", v_tmp1_a, v_idx_prev2[0], v_n_nodes),
+                ("<", v_tmp1_b, v_idx_prev2[1], v_n_nodes),
+                ("<", v_tmp1_c, v_idx_prev2[2], v_n_nodes),
+                ("<", v_tmp1_d, v_idx_prev2[3], v_n_nodes),
+            ]})
+            # gi=15: gather D[6,7], idx *= cmp (for all 4)
+            self.instrs.append({"load": [
+                ("load_offset", nv_cur2[3], addr_cur2[3], 6),
+                ("load_offset", nv_cur2[3], addr_cur2[3], 7),
+            ], "valu": [
+                ("*", v_idx_prev2[0], v_idx_prev2[0], v_tmp1_a),
+                ("*", v_idx_prev2[1], v_idx_prev2[1], v_tmp1_b),
+                ("*", v_idx_prev2[2], v_idx_prev2[2], v_tmp1_c),
+                ("*", v_idx_prev2[3], v_idx_prev2[3], v_tmp1_d),
             ]})
 
-            # Index computation (idx*2+1 already done, just add mask)
-            self.instrs.append({"valu": [
-                ("&", v_tmp1_a, v_val_prev_a, v_one),
-                ("&", v_tmp1_b, v_val_prev_b, v_one),
-            ]})
-            self.instrs.append({"valu": [
-                ("+", v_idx_prev_a, v_idx_prev_a, v_tmp1_a), ("+", v_idx_prev_b, v_idx_prev_b, v_tmp1_b),
-            ]})
-            self.instrs.append({"valu": [
-                ("<", v_tmp1_a, v_idx_prev_a, v_n_nodes), ("<", v_tmp1_b, v_idx_prev_b, v_n_nodes),
-            ]})
-            self.instrs.append({"valu": [
-                ("*", v_idx_prev_a, v_idx_prev_a, v_tmp1_a), ("*", v_idx_prev_b, v_idx_prev_b, v_tmp1_b),
-            ]})
-
-        # Epilogue for third loop
-        ia_last2, ib_last2 = (NUM_BATCHES - 1) * 2, (NUM_BATCHES - 1) * 2 + 1
-        v_idx_last2_a, v_val_last2_a = all_idx[ia_last2], all_val[ia_last2]
-        v_idx_last2_b, v_val_last2_b = all_idx[ib_last2], all_val[ib_last2]
-        if (NUM_BATCHES - 1) % 2 == 1:
-            nv_last2_a, nv_last2_b = v_node_val_a2, v_node_val_b2
+        # Epilogue for third loop - with overlapped next-round gather
+        last_base2 = (NUM_BATCHES_4 - 1) * 4
+        v_idx_last2 = [all_idx[last_base2 + j] for j in range(4)]
+        v_val_last2 = [all_val[last_base2 + j] for j in range(4)]
+        if (NUM_BATCHES_4 - 1) % 2 == 1:
+            nv_last2 = [v_node_val_a2, v_node_val_b2, v_node_val_c2, v_node_val_d2]
         else:
-            nv_last2_a, nv_last2_b = v_node_val_a, v_node_val_b
+            nv_last2 = [v_node_val_a, v_node_val_b, v_node_val_c, v_node_val_d]
 
+        # For next round's prologue
+        if (NUM_BATCHES_4 - 1) % 2 == 1:
+            nv_next2 = [v_node_val_a, v_node_val_b, v_node_val_c, v_node_val_d]
+            addr_next2 = [v_addr_a, v_addr_b, v_addr_c, v_addr_d]
+        else:
+            nv_next2 = [v_node_val_a2, v_node_val_b2, v_node_val_c2, v_node_val_d2]
+            addr_next2 = [v_addr_a2, v_addr_b2, v_addr_c2, v_addr_d2]
+
+        # XOR + compute addresses for next round's batch 0
         self.instrs.append({"valu": [
-            ("^", v_val_last2_a, v_val_last2_a, nv_last2_a),
-            ("^", v_val_last2_b, v_val_last2_b, nv_last2_b),
+            ("^", v_val_last2[0], v_val_last2[0], nv_last2[0]),
+            ("^", v_val_last2[1], v_val_last2[1], nv_last2[1]),
+            ("^", v_val_last2[2], v_val_last2[2], nv_last2[2]),
+            ("^", v_val_last2[3], v_val_last2[3], nv_last2[3]),
+            ("+", addr_next2[0], all_idx[0], v_forest_p),
+            ("+", addr_next2[1], all_idx[1], v_forest_p),
         ]})
-        # Hash (6 stages) - use multiply_add for stages 0, 2, 4
-        for hi, (op1, val1, op2, op3, val3) in enumerate(HASH_STAGES):
-            v_c1, v_c3 = v_hash_consts[hi]
-            if hi in mul_add_stages:
-                v_mul = mul_add_stages[hi]
-                self.instrs.append({"valu": [
-                    ("multiply_add", v_val_last2_a, v_val_last2_a, v_mul, v_c1),
-                    ("multiply_add", v_val_last2_b, v_val_last2_b, v_mul, v_c1),
-                ]})
-            else:
-                self.instrs.append({"valu": [
-                    (op1, v_tmp1_a, v_val_last2_a, v_c1), (op3, v_tmp2_a, v_val_last2_a, v_c3),
-                    (op1, v_tmp1_b, v_val_last2_b, v_c1), (op3, v_tmp2_b, v_val_last2_b, v_c3),
-                ]})
-                self.instrs.append({"valu": [
-                    (op2, v_val_last2_a, v_tmp1_a, v_tmp2_a),
-                    (op2, v_val_last2_b, v_tmp1_b, v_tmp2_b),
-                ]})
+        # Hash stage 0 + remaining addresses
         self.instrs.append({"valu": [
-            ("&", v_tmp1_a, v_val_last2_a, v_one), ("multiply_add", v_idx_last2_a, v_idx_last2_a, v_two, v_one),
-            ("&", v_tmp1_b, v_val_last2_b, v_one), ("multiply_add", v_idx_last2_b, v_idx_last2_b, v_two, v_one),
+            ("multiply_add", v_val_last2[0], v_val_last2[0], v_mul_4097, v_c1_0),
+            ("multiply_add", v_val_last2[1], v_val_last2[1], v_mul_4097, v_c1_0),
+            ("multiply_add", v_val_last2[2], v_val_last2[2], v_mul_4097, v_c1_0),
+            ("multiply_add", v_val_last2[3], v_val_last2[3], v_mul_4097, v_c1_0),
+            ("+", addr_next2[2], all_idx[2], v_forest_p),
+            ("+", addr_next2[3], all_idx[3], v_forest_p),
         ]})
-        self.instrs.append({"valu": [
-            ("+", v_idx_last2_a, v_idx_last2_a, v_tmp1_a), ("+", v_idx_last2_b, v_idx_last2_b, v_tmp1_b),
+        # Overlap hash stages 1-5 and index with 16 gather cycles for next round
+        # gi=0: gather A[0,1], stage 1a (part 1)
+        self.instrs.append({"load": [
+            ("load_offset", nv_next2[0], addr_next2[0], 0),
+            ("load_offset", nv_next2[0], addr_next2[0], 1),
+        ], "valu": [
+            (h_stage1[0], v_tmp1_a, v_val_last2[0], v_c1_1),
+            (h_stage1[3], v_tmp2_a, v_val_last2[0], v_c3_1),
+            (h_stage1[0], v_tmp1_b, v_val_last2[1], v_c1_1),
+            (h_stage1[3], v_tmp2_b, v_val_last2[1], v_c3_1),
         ]})
-        # Merge loop control with epilogue index computation
-        self.instrs.append({"valu": [
-            ("<", v_tmp1_a, v_idx_last2_a, v_n_nodes), ("<", v_tmp1_b, v_idx_last2_b, v_n_nodes),
+        # gi=1: gather A[2,3], stage 1a (part 2)
+        self.instrs.append({"load": [
+            ("load_offset", nv_next2[0], addr_next2[0], 2),
+            ("load_offset", nv_next2[0], addr_next2[0], 3),
+        ], "valu": [
+            (h_stage1[0], v_tmp1_c, v_val_last2[2], v_c1_1),
+            (h_stage1[3], v_tmp2_c, v_val_last2[2], v_c3_1),
+            (h_stage1[0], v_tmp1_d, v_val_last2[3], v_c1_1),
+            (h_stage1[3], v_tmp2_d, v_val_last2[3], v_c3_1),
+        ]})
+        # gi=2: gather A[4,5], stage 1b (combine)
+        self.instrs.append({"load": [
+            ("load_offset", nv_next2[0], addr_next2[0], 4),
+            ("load_offset", nv_next2[0], addr_next2[0], 5),
+        ], "valu": [
+            (h_stage1[2], v_val_last2[0], v_tmp1_a, v_tmp2_a),
+            (h_stage1[2], v_val_last2[1], v_tmp1_b, v_tmp2_b),
+            (h_stage1[2], v_val_last2[2], v_tmp1_c, v_tmp2_c),
+            (h_stage1[2], v_val_last2[3], v_tmp1_d, v_tmp2_d),
+        ]})
+        # gi=3: gather A[6,7], stage 2
+        self.instrs.append({"load": [
+            ("load_offset", nv_next2[0], addr_next2[0], 6),
+            ("load_offset", nv_next2[0], addr_next2[0], 7),
+        ], "valu": [
+            ("multiply_add", v_val_last2[0], v_val_last2[0], v_mul_33, v_c1_2),
+            ("multiply_add", v_val_last2[1], v_val_last2[1], v_mul_33, v_c1_2),
+            ("multiply_add", v_val_last2[2], v_val_last2[2], v_mul_33, v_c1_2),
+            ("multiply_add", v_val_last2[3], v_val_last2[3], v_mul_33, v_c1_2),
+        ]})
+        # gi=4: gather B[0,1], stage 3a (part 1)
+        self.instrs.append({"load": [
+            ("load_offset", nv_next2[1], addr_next2[1], 0),
+            ("load_offset", nv_next2[1], addr_next2[1], 1),
+        ], "valu": [
+            (h_stage3[0], v_tmp1_a, v_val_last2[0], v_c1_3),
+            (h_stage3[3], v_tmp2_a, v_val_last2[0], v_c3_3),
+            (h_stage3[0], v_tmp1_b, v_val_last2[1], v_c1_3),
+            (h_stage3[3], v_tmp2_b, v_val_last2[1], v_c3_3),
+        ]})
+        # gi=5: gather B[2,3], stage 3a (part 2)
+        self.instrs.append({"load": [
+            ("load_offset", nv_next2[1], addr_next2[1], 2),
+            ("load_offset", nv_next2[1], addr_next2[1], 3),
+        ], "valu": [
+            (h_stage3[0], v_tmp1_c, v_val_last2[2], v_c1_3),
+            (h_stage3[3], v_tmp2_c, v_val_last2[2], v_c3_3),
+            (h_stage3[0], v_tmp1_d, v_val_last2[3], v_c1_3),
+            (h_stage3[3], v_tmp2_d, v_val_last2[3], v_c3_3),
+        ]})
+        # gi=6: gather B[4,5], stage 3b (combine)
+        self.instrs.append({"load": [
+            ("load_offset", nv_next2[1], addr_next2[1], 4),
+            ("load_offset", nv_next2[1], addr_next2[1], 5),
+        ], "valu": [
+            (h_stage3[2], v_val_last2[0], v_tmp1_a, v_tmp2_a),
+            (h_stage3[2], v_val_last2[1], v_tmp1_b, v_tmp2_b),
+            (h_stage3[2], v_val_last2[2], v_tmp1_c, v_tmp2_c),
+            (h_stage3[2], v_val_last2[3], v_tmp1_d, v_tmp2_d),
+        ]})
+        # gi=7: gather B[6,7], stage 4
+        self.instrs.append({"load": [
+            ("load_offset", nv_next2[1], addr_next2[1], 6),
+            ("load_offset", nv_next2[1], addr_next2[1], 7),
+        ], "valu": [
+            ("multiply_add", v_val_last2[0], v_val_last2[0], v_mul_9, v_c1_4),
+            ("multiply_add", v_val_last2[1], v_val_last2[1], v_mul_9, v_c1_4),
+            ("multiply_add", v_val_last2[2], v_val_last2[2], v_mul_9, v_c1_4),
+            ("multiply_add", v_val_last2[3], v_val_last2[3], v_mul_9, v_c1_4),
+        ]})
+        # gi=8: gather C[0,1], stage 5a (part 1)
+        self.instrs.append({"load": [
+            ("load_offset", nv_next2[2], addr_next2[2], 0),
+            ("load_offset", nv_next2[2], addr_next2[2], 1),
+        ], "valu": [
+            (h_stage5[0], v_tmp1_a, v_val_last2[0], v_c1_5),
+            (h_stage5[3], v_tmp2_a, v_val_last2[0], v_c3_5),
+            (h_stage5[0], v_tmp1_b, v_val_last2[1], v_c1_5),
+            (h_stage5[3], v_tmp2_b, v_val_last2[1], v_c3_5),
+        ]})
+        # gi=9: gather C[2,3], stage 5a (part 2)
+        self.instrs.append({"load": [
+            ("load_offset", nv_next2[2], addr_next2[2], 2),
+            ("load_offset", nv_next2[2], addr_next2[2], 3),
+        ], "valu": [
+            (h_stage5[0], v_tmp1_c, v_val_last2[2], v_c1_5),
+            (h_stage5[3], v_tmp2_c, v_val_last2[2], v_c3_5),
+            (h_stage5[0], v_tmp1_d, v_val_last2[3], v_c1_5),
+            (h_stage5[3], v_tmp2_d, v_val_last2[3], v_c3_5),
+        ]})
+        # gi=10: gather C[4,5], stage 5b (combine)
+        self.instrs.append({"load": [
+            ("load_offset", nv_next2[2], addr_next2[2], 4),
+            ("load_offset", nv_next2[2], addr_next2[2], 5),
+        ], "valu": [
+            (h_stage5[2], v_val_last2[0], v_tmp1_a, v_tmp2_a),
+            (h_stage5[2], v_val_last2[1], v_tmp1_b, v_tmp2_b),
+            (h_stage5[2], v_val_last2[2], v_tmp1_c, v_tmp2_c),
+            (h_stage5[2], v_val_last2[3], v_tmp1_d, v_tmp2_d),
+        ]})
+        # gi=11: gather C[6,7], idx*2+1
+        self.instrs.append({"load": [
+            ("load_offset", nv_next2[2], addr_next2[2], 6),
+            ("load_offset", nv_next2[2], addr_next2[2], 7),
+        ], "valu": [
+            ("multiply_add", v_idx_last2[0], v_idx_last2[0], v_two, v_one),
+            ("multiply_add", v_idx_last2[1], v_idx_last2[1], v_two, v_one),
+            ("multiply_add", v_idx_last2[2], v_idx_last2[2], v_two, v_one),
+            ("multiply_add", v_idx_last2[3], v_idx_last2[3], v_two, v_one),
+        ]})
+        # gi=12: gather D[0,1], val&1
+        self.instrs.append({"load": [
+            ("load_offset", nv_next2[3], addr_next2[3], 0),
+            ("load_offset", nv_next2[3], addr_next2[3], 1),
+        ], "valu": [
+            ("&", v_tmp1_a, v_val_last2[0], v_one),
+            ("&", v_tmp1_b, v_val_last2[1], v_one),
+            ("&", v_tmp1_c, v_val_last2[2], v_one),
+            ("&", v_tmp1_d, v_val_last2[3], v_one),
+        ]})
+        # gi=13: gather D[2,3], idx += mask
+        self.instrs.append({"load": [
+            ("load_offset", nv_next2[3], addr_next2[3], 2),
+            ("load_offset", nv_next2[3], addr_next2[3], 3),
+        ], "valu": [
+            ("+", v_idx_last2[0], v_idx_last2[0], v_tmp1_a),
+            ("+", v_idx_last2[1], v_idx_last2[1], v_tmp1_b),
+            ("+", v_idx_last2[2], v_idx_last2[2], v_tmp1_c),
+            ("+", v_idx_last2[3], v_idx_last2[3], v_tmp1_d),
+        ]})
+        # gi=14: gather D[4,5], idx < n_nodes
+        self.instrs.append({"load": [
+            ("load_offset", nv_next2[3], addr_next2[3], 4),
+            ("load_offset", nv_next2[3], addr_next2[3], 5),
+        ], "valu": [
+            ("<", v_tmp1_a, v_idx_last2[0], v_n_nodes),
+            ("<", v_tmp1_b, v_idx_last2[1], v_n_nodes),
+            ("<", v_tmp1_c, v_idx_last2[2], v_n_nodes),
+            ("<", v_tmp1_d, v_idx_last2[3], v_n_nodes),
         ], "alu": [("+", round_counter, round_counter, one_const)]})
-        self.instrs.append({"valu": [
-            ("*", v_idx_last2_a, v_idx_last2_a, v_tmp1_a), ("*", v_idx_last2_b, v_idx_last2_b, v_tmp1_b),
+        # gi=15: gather D[6,7], idx *= cmp + loop control
+        self.instrs.append({"load": [
+            ("load_offset", nv_next2[3], addr_next2[3], 6),
+            ("load_offset", nv_next2[3], addr_next2[3], 7),
+        ], "valu": [
+            ("*", v_idx_last2[0], v_idx_last2[0], v_tmp1_a),
+            ("*", v_idx_last2[1], v_idx_last2[1], v_tmp1_b),
+            ("*", v_idx_last2[2], v_idx_last2[2], v_tmp1_c),
+            ("*", v_idx_last2[3], v_idx_last2[3], v_tmp1_d),
         ], "alu": [("<", loop_cond, round_counter, self.scratch["rounds"])]})
         self.instrs.append({"flow": [("cond_jump", loop_cond, outer_loop_start_2)]})
 
