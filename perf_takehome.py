@@ -348,11 +348,21 @@ class KernelBuilder:
         v_tmp3_e = self.alloc_scratch("v_tmp3_e", VLEN)
         v_tmp3_f = self.alloc_scratch("v_tmp3_f", VLEN)
 
+        # Pre-allocate round 1 scratch before round 0 loop (for overlap optimization)
+        tree1_scalar = self.alloc_scratch("tree1_scalar")
+        tree2_scalar = self.alloc_scratch("tree2_scalar")
+        diff_scalar = self.alloc_scratch("diff_scalar")
+        v_tree1 = self.alloc_scratch("v_tree1", VLEN)
+        v_diff = self.alloc_scratch("v_diff", VLEN)
+        v_offset = self.alloc_scratch("v_offset", VLEN)
+        v_node_tmp = self.alloc_scratch("v_node_tmp", VLEN)
+
         # Process 6 vectors (48 items) at a time for better valu utilization
         # 32 vectors / 6 = 5.33, so process in chunks: 6, 6, 6, 6, 6, 2
         vec_batches = [(0, 6), (6, 6), (12, 6), (18, 6), (24, 6), (30, 2)]
 
-        for start_vec, num_vecs in vec_batches:
+        for batch_idx, (start_vec, num_vecs) in enumerate(vec_batches):
+            is_last_batch = (batch_idx == len(vec_batches) - 1)
             vecs = [(all_idx[i], all_val[i]) for i in range(start_vec, start_vec + num_vecs)]
             tmp1_list = [v_tmp1_a, v_tmp1_b, v_tmp1_c, v_tmp1_d, v_tmp1_e, v_tmp1_f][:num_vecs]
             tmp2_list = [v_tmp2_a, v_tmp2_b, v_tmp2_c, v_tmp2_d, v_tmp2_e, v_tmp2_f][:num_vecs]
@@ -396,32 +406,28 @@ class KernelBuilder:
 
             # Index computation: idx=0, so new_idx = 0*2 + (1 or 2) = 1 + (val & 1)
             and_ops = [("&", t1, v_val, v_one) for (v_idx, v_val), t1 in zip(vecs, tmp1_list)]
-            self.instrs.append({"valu": and_ops})
-
             add_ops = [("+", v_idx, v_one, t1) for (v_idx, v_val), t1 in zip(vecs, tmp1_list)]
-            self.instrs.append({"valu": add_ops})
+
+            if is_last_batch:
+                # Overlap tree[1], tree[2] address computation with index and_ops (saves 1 cycle)
+                self.instrs.append({"valu": and_ops, "alu": [
+                    ("+", addr_tmp, self.scratch["forest_values_p"], one_const),
+                    ("+", addr_tmp2, self.scratch["forest_values_p"], two_const),
+                ]})
+                # Overlap tree load with index add_ops (saves 1 cycle)
+                self.instrs.append({"valu": add_ops, "load": [
+                    ("load", tree1_scalar, addr_tmp),
+                    ("load", tree2_scalar, addr_tmp2),
+                ]})
+            else:
+                self.instrs.append({"valu": and_ops})
+                self.instrs.append({"valu": add_ops})
             # No wrapping check needed since 1 and 2 are < n_nodes
 
         # ============================================
         # ROUND 1: All indices are 1 or 2 (use arithmetic instead of gather)
+        # tree[1] and tree[2] already loaded above during round 0's last batch
         # ============================================
-        tree1_scalar = self.alloc_scratch("tree1_scalar")
-        tree2_scalar = self.alloc_scratch("tree2_scalar")
-        diff_scalar = self.alloc_scratch("diff_scalar")
-        v_tree1 = self.alloc_scratch("v_tree1", VLEN)
-        v_diff = self.alloc_scratch("v_diff", VLEN)
-        v_offset = self.alloc_scratch("v_offset", VLEN)
-        v_node_tmp = self.alloc_scratch("v_node_tmp", VLEN)
-
-        # Load tree[1] and tree[2] (parallel: 4 cycles -> 2 cycles)
-        self.instrs.append({"alu": [
-            ("+", addr_tmp, self.scratch["forest_values_p"], one_const),
-            ("+", addr_tmp2, self.scratch["forest_values_p"], two_const),
-        ]})
-        self.instrs.append({"load": [
-            ("load", tree1_scalar, addr_tmp),
-            ("load", tree2_scalar, addr_tmp2),
-        ]})
 
         # Compute diff = tree2 - tree1 and c = tree1 - diff for multiply_add optimization
         # node_val = tree1 + (idx - 1) * diff = idx * diff + (tree1 - diff) = multiply_add(idx, diff, c)
@@ -1087,7 +1093,8 @@ class KernelBuilder:
         # ============================================
         self.instrs.append({"valu": [("vbroadcast", v_tree0, tree0_scalar)]})
 
-        for start_vec, num_vecs in vec_batches:
+        for batch_idx, (start_vec, num_vecs) in enumerate(vec_batches):
+            is_last_batch = (batch_idx == len(vec_batches) - 1)
             vecs = [(all_idx[i], all_val[i]) for i in range(start_vec, start_vec + num_vecs)]
             tmp1_list = [v_tmp1_a, v_tmp1_b, v_tmp1_c, v_tmp1_d, v_tmp1_e, v_tmp1_f][:num_vecs]
             tmp2_list = [v_tmp2_a, v_tmp2_b, v_tmp2_c, v_tmp2_d, v_tmp2_e, v_tmp2_f][:num_vecs]
@@ -1127,23 +1134,27 @@ class KernelBuilder:
                     self.instrs.append({"valu": combine_ops})
 
             and_ops = [("&", t1, v_val, v_one) for (v_idx, v_val), t1 in zip(vecs, tmp1_list)]
-            self.instrs.append({"valu": and_ops})
-
             add_ops = [("+", v_idx, v_one, t1) for (v_idx, v_val), t1 in zip(vecs, tmp1_list)]
-            self.instrs.append({"valu": add_ops})
+
+            if is_last_batch:
+                # Overlap tree[1], tree[2] address computation with index and_ops (saves 1 cycle)
+                self.instrs.append({"valu": and_ops, "alu": [
+                    ("+", addr_tmp, self.scratch["forest_values_p"], one_const),
+                    ("+", addr_tmp2, self.scratch["forest_values_p"], two_const),
+                ]})
+                # Overlap tree load with index add_ops (saves 1 cycle)
+                self.instrs.append({"valu": add_ops, "load": [
+                    ("load", tree1_scalar, addr_tmp),
+                    ("load", tree2_scalar, addr_tmp2),
+                ]})
+            else:
+                self.instrs.append({"valu": and_ops})
+                self.instrs.append({"valu": add_ops})
 
         # ============================================
         # ROUND 12: All indices are 1 or 2 (use arithmetic instead of gather)
+        # tree[1] and tree[2] already loaded above during round 11's last batch
         # ============================================
-        # Load tree[1] and tree[2] (parallel: 4 cycles -> 2 cycles)
-        self.instrs.append({"alu": [
-            ("+", addr_tmp, self.scratch["forest_values_p"], one_const),
-            ("+", addr_tmp2, self.scratch["forest_values_p"], two_const),
-        ]})
-        self.instrs.append({"load": [
-            ("load", tree1_scalar, addr_tmp),
-            ("load", tree2_scalar, addr_tmp2),
-        ]})
         # Compute diff and c for multiply_add optimization
         self.instrs.append({"alu": [("-", diff_scalar, tree2_scalar, tree1_scalar)]})
         self.instrs.append({"alu": [("-", c_scalar, tree1_scalar, diff_scalar)]})
