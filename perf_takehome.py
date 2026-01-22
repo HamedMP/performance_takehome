@@ -182,6 +182,13 @@ class KernelBuilder:
             v_c3 = self.alloc_scratch(f"v_hash_c3_{hi}", VLEN)
             v_hash_consts.append((v_c1, v_c3))
 
+        # For multiply_add optimization: stages 0, 2, 4 use (val + c1) + (val << shift) = val * (1 + 2^shift) + c1
+        # Stage 0: 1 + 2^12 = 4097, Stage 2: 1 + 2^5 = 33, Stage 4: 1 + 2^3 = 9
+        v_mul_4097 = self.alloc_scratch("v_mul_4097", VLEN)
+        v_mul_33 = self.alloc_scratch("v_mul_33", VLEN)
+        v_mul_9 = self.alloc_scratch("v_mul_9", VLEN)
+        mul_consts = [(0, v_mul_4097, 4097), (2, v_mul_33, 33), (4, v_mul_9, 9)]
+
         round_counter = self.alloc_scratch("round_counter")
         loop_cond = self.alloc_scratch("loop_cond")
         addr_tmp = self.alloc_scratch("addr_tmp")
@@ -205,6 +212,14 @@ class KernelBuilder:
                 ("vbroadcast", v_hash_consts[hi][0], c1_addr),
                 ("vbroadcast", v_hash_consts[hi][1], c3_addr),
             ]})
+
+        # Broadcast multiply_add constants
+        for hi, v_mul, mul_val in mul_consts:
+            mul_addr = self.scratch_const(mul_val)
+            self.instrs.append({"valu": [("vbroadcast", v_mul, mul_addr)]})
+
+        # Map stages to multiply_add vectors: stages 0, 2, 4 can use multiply_add
+        mul_add_stages = {0: v_mul_4097, 2: v_mul_33, 4: v_mul_9}
 
         # Pre-compute all load/store addresses as constants
         addr_consts = [self.scratch_const(i * VLEN) for i in range(batch_size // VLEN)]
@@ -272,33 +287,38 @@ class KernelBuilder:
             xor_ops = [("^", v_val, v_val, v_tree0) for v_idx, v_val in vecs]
             self.instrs.append({"valu": xor_ops})
 
-            # Hash (6 stages)
+            # Hash (6 stages) - use multiply_add for stages 0, 2, 4
             for hi, (op1, val1, op2, op3, val3) in enumerate(HASH_STAGES):
                 v_c1, v_c3 = v_hash_consts[hi]
-                # tmp1 and tmp2 can be computed in parallel
-                # Cycle 1: interleave tmp1 and tmp2 ops
-                ops1 = []
-                for i, ((v_idx, v_val), t1, t2) in enumerate(zip(vecs, tmp1_list, tmp2_list)):
-                    if len(ops1) < 6:
-                        ops1.append((op1, t1, v_val, v_c1))
-                    if len(ops1) < 6:
-                        ops1.append((op3, t2, v_val, v_c3))
-                self.instrs.append({"valu": ops1})
 
-                # Remaining tmp ops + val combine
-                remaining_tmp = []
-                for i, ((v_idx, v_val), t1, t2) in enumerate(zip(vecs, tmp1_list, tmp2_list)):
-                    if i * 2 >= 6:  # Not covered in first cycle
-                        remaining_tmp.append((op1, t1, v_val, v_c1))
-                    if i * 2 + 1 >= 6:
-                        remaining_tmp.append((op3, t2, v_val, v_c3))
+                if hi in mul_add_stages:
+                    # Stages 0, 2, 4: val = val * multiplier + c1 (single multiply_add)
+                    v_mul = mul_add_stages[hi]
+                    mul_add_ops = [("multiply_add", v_val, v_val, v_mul, v_c1) for (v_idx, v_val) in vecs]
+                    self.instrs.append({"valu": mul_add_ops[:6]})
+                    if len(mul_add_ops) > 6:
+                        self.instrs.append({"valu": mul_add_ops[6:]})
+                else:
+                    # Stages 1, 3, 5: use standard tmp1/tmp2 pattern
+                    ops1 = []
+                    for i, ((v_idx, v_val), t1, t2) in enumerate(zip(vecs, tmp1_list, tmp2_list)):
+                        if len(ops1) < 6:
+                            ops1.append((op1, t1, v_val, v_c1))
+                        if len(ops1) < 6:
+                            ops1.append((op3, t2, v_val, v_c3))
+                    self.instrs.append({"valu": ops1})
 
-                if remaining_tmp:
-                    self.instrs.append({"valu": remaining_tmp})
+                    remaining_tmp = []
+                    for i, ((v_idx, v_val), t1, t2) in enumerate(zip(vecs, tmp1_list, tmp2_list)):
+                        if i * 2 >= 6:
+                            remaining_tmp.append((op1, t1, v_val, v_c1))
+                        if i * 2 + 1 >= 6:
+                            remaining_tmp.append((op3, t2, v_val, v_c3))
+                    if remaining_tmp:
+                        self.instrs.append({"valu": remaining_tmp})
 
-                # Final combine: val = op2(tmp1, tmp2)
-                combine_ops = [(op2, v_val, t1, t2) for (v_idx, v_val), t1, t2 in zip(vecs, tmp1_list, tmp2_list)]
-                self.instrs.append({"valu": combine_ops})
+                    combine_ops = [(op2, v_val, t1, t2) for (v_idx, v_val), t1, t2 in zip(vecs, tmp1_list, tmp2_list)]
+                    self.instrs.append({"valu": combine_ops})
 
             # Index computation: idx=0, so new_idx = 0*2 + (1 or 2) = 1 + (val & 1)
             and_ops = [("&", t1, v_val, v_one) for (v_idx, v_val), t1 in zip(vecs, tmp1_list)]
@@ -354,28 +374,36 @@ class KernelBuilder:
             xor_ops = [("^", v_val, v_val, t1) for (v_idx, v_val), t1 in zip(vecs, tmp1_list)]
             self.instrs.append({"valu": xor_ops})
 
-            # Hash (6 stages)
+            # Hash (6 stages) - use multiply_add for stages 0, 2, 4
             for hi, (op1, val1, op2, op3, val3) in enumerate(HASH_STAGES):
                 v_c1, v_c3 = v_hash_consts[hi]
-                ops1 = []
-                for i, ((v_idx, v_val), t1, t2) in enumerate(zip(vecs, tmp1_list, tmp2_list)):
-                    if len(ops1) < 6:
-                        ops1.append((op1, t1, v_val, v_c1))
-                    if len(ops1) < 6:
-                        ops1.append((op3, t2, v_val, v_c3))
-                self.instrs.append({"valu": ops1})
 
-                remaining_tmp = []
-                for i, ((v_idx, v_val), t1, t2) in enumerate(zip(vecs, tmp1_list, tmp2_list)):
-                    if i * 2 >= 6:
-                        remaining_tmp.append((op1, t1, v_val, v_c1))
-                    if i * 2 + 1 >= 6:
-                        remaining_tmp.append((op3, t2, v_val, v_c3))
-                if remaining_tmp:
-                    self.instrs.append({"valu": remaining_tmp})
+                if hi in mul_add_stages:
+                    v_mul = mul_add_stages[hi]
+                    mul_add_ops = [("multiply_add", v_val, v_val, v_mul, v_c1) for (v_idx, v_val) in vecs]
+                    self.instrs.append({"valu": mul_add_ops[:6]})
+                    if len(mul_add_ops) > 6:
+                        self.instrs.append({"valu": mul_add_ops[6:]})
+                else:
+                    ops1 = []
+                    for i, ((v_idx, v_val), t1, t2) in enumerate(zip(vecs, tmp1_list, tmp2_list)):
+                        if len(ops1) < 6:
+                            ops1.append((op1, t1, v_val, v_c1))
+                        if len(ops1) < 6:
+                            ops1.append((op3, t2, v_val, v_c3))
+                    self.instrs.append({"valu": ops1})
 
-                combine_ops = [(op2, v_val, t1, t2) for (v_idx, v_val), t1, t2 in zip(vecs, tmp1_list, tmp2_list)]
-                self.instrs.append({"valu": combine_ops})
+                    remaining_tmp = []
+                    for i, ((v_idx, v_val), t1, t2) in enumerate(zip(vecs, tmp1_list, tmp2_list)):
+                        if i * 2 >= 6:
+                            remaining_tmp.append((op1, t1, v_val, v_c1))
+                        if i * 2 + 1 >= 6:
+                            remaining_tmp.append((op3, t2, v_val, v_c3))
+                    if remaining_tmp:
+                        self.instrs.append({"valu": remaining_tmp})
+
+                    combine_ops = [(op2, v_val, t1, t2) for (v_idx, v_val), t1, t2 in zip(vecs, tmp1_list, tmp2_list)]
+                    self.instrs.append({"valu": combine_ops})
 
             # Index computation: new_idx = idx * 2 + (1 + (val & 1))
             # idx is 1 or 2, so idx*2 is 2 or 4
@@ -521,24 +549,16 @@ class KernelBuilder:
                     ]
                 self.instrs.append({"load": load_ops, "valu": valu_ops})
 
-            # Hash stages 4-5 for previous batch, overlapping idx*2 with hash 4 part 2
-            # Hash 4 part 1
-            h_stage = HASH_STAGES[4]
-            v_c1, v_c3 = v_hash_consts[4]
+            # Hash stages 4-5 for previous batch - use multiply_add for stage 4
+            # Hash 4: val = val * 9 + c1 (multiply_add) + idx*2 overlapped
+            v_c1_4 = v_hash_consts[4][0]
             self.instrs.append({"valu": [
-                (h_stage[0], v_tmp1_a, v_val_prev_a, v_c1),
-                (h_stage[3], v_tmp2_a, v_val_prev_a, v_c3),
-                (h_stage[0], v_tmp1_b, v_val_prev_b, v_c1),
-                (h_stage[3], v_tmp2_b, v_val_prev_b, v_c3),
-            ]})
-            # Hash 4 part 2 + idx*2 (overlapped!)
-            self.instrs.append({"valu": [
-                (h_stage[2], v_val_prev_a, v_tmp1_a, v_tmp2_a),
-                (h_stage[2], v_val_prev_b, v_tmp1_b, v_tmp2_b),
+                ("multiply_add", v_val_prev_a, v_val_prev_a, v_mul_9, v_c1_4),
+                ("multiply_add", v_val_prev_b, v_val_prev_b, v_mul_9, v_c1_4),
                 ("*", v_idx_prev_a, v_idx_prev_a, v_two),
                 ("*", v_idx_prev_b, v_idx_prev_b, v_two),
             ]})
-            # Hash 5
+            # Hash 5: val = (val ^ c1) ^ (val >> 16) - can't use multiply_add
             h_stage = HASH_STAGES[5]
             v_c1, v_c3 = v_hash_consts[5]
             self.instrs.append({"valu": [
@@ -583,16 +603,24 @@ class KernelBuilder:
             ("^", v_val_last_a, v_val_last_a, nv_last_a),
             ("^", v_val_last_b, v_val_last_b, nv_last_b),
         ]})
+        # Hash (6 stages) - use multiply_add for stages 0, 2, 4
         for hi, (op1, val1, op2, op3, val3) in enumerate(HASH_STAGES):
             v_c1, v_c3 = v_hash_consts[hi]
-            self.instrs.append({"valu": [
-                (op1, v_tmp1_a, v_val_last_a, v_c1), (op3, v_tmp2_a, v_val_last_a, v_c3),
-                (op1, v_tmp1_b, v_val_last_b, v_c1), (op3, v_tmp2_b, v_val_last_b, v_c3),
-            ]})
-            self.instrs.append({"valu": [
-                (op2, v_val_last_a, v_tmp1_a, v_tmp2_a),
-                (op2, v_val_last_b, v_tmp1_b, v_tmp2_b),
-            ]})
+            if hi in mul_add_stages:
+                v_mul = mul_add_stages[hi]
+                self.instrs.append({"valu": [
+                    ("multiply_add", v_val_last_a, v_val_last_a, v_mul, v_c1),
+                    ("multiply_add", v_val_last_b, v_val_last_b, v_mul, v_c1),
+                ]})
+            else:
+                self.instrs.append({"valu": [
+                    (op1, v_tmp1_a, v_val_last_a, v_c1), (op3, v_tmp2_a, v_val_last_a, v_c3),
+                    (op1, v_tmp1_b, v_val_last_b, v_c1), (op3, v_tmp2_b, v_val_last_b, v_c3),
+                ]})
+                self.instrs.append({"valu": [
+                    (op2, v_val_last_a, v_tmp1_a, v_tmp2_a),
+                    (op2, v_val_last_b, v_tmp1_b, v_tmp2_b),
+                ]})
         self.instrs.append({"valu": [
             ("&", v_tmp1_a, v_val_last_a, v_one), ("*", v_idx_last_a, v_idx_last_a, v_two),
             ("&", v_tmp1_b, v_val_last_b, v_one), ("*", v_idx_last_b, v_idx_last_b, v_two),
@@ -630,27 +658,36 @@ class KernelBuilder:
             xor_ops = [("^", v_val, v_val, v_tree0) for v_idx, v_val in vecs]
             self.instrs.append({"valu": xor_ops})
 
+            # Hash (6 stages) - use multiply_add for stages 0, 2, 4
             for hi, (op1, val1, op2, op3, val3) in enumerate(HASH_STAGES):
                 v_c1, v_c3 = v_hash_consts[hi]
-                ops1 = []
-                for i, ((v_idx, v_val), t1, t2) in enumerate(zip(vecs, tmp1_list, tmp2_list)):
-                    if len(ops1) < 6:
-                        ops1.append((op1, t1, v_val, v_c1))
-                    if len(ops1) < 6:
-                        ops1.append((op3, t2, v_val, v_c3))
-                self.instrs.append({"valu": ops1})
 
-                remaining_tmp = []
-                for i, ((v_idx, v_val), t1, t2) in enumerate(zip(vecs, tmp1_list, tmp2_list)):
-                    if i * 2 >= 6:
-                        remaining_tmp.append((op1, t1, v_val, v_c1))
-                    if i * 2 + 1 >= 6:
-                        remaining_tmp.append((op3, t2, v_val, v_c3))
-                if remaining_tmp:
-                    self.instrs.append({"valu": remaining_tmp})
+                if hi in mul_add_stages:
+                    v_mul = mul_add_stages[hi]
+                    mul_add_ops = [("multiply_add", v_val, v_val, v_mul, v_c1) for (v_idx, v_val) in vecs]
+                    self.instrs.append({"valu": mul_add_ops[:6]})
+                    if len(mul_add_ops) > 6:
+                        self.instrs.append({"valu": mul_add_ops[6:]})
+                else:
+                    ops1 = []
+                    for i, ((v_idx, v_val), t1, t2) in enumerate(zip(vecs, tmp1_list, tmp2_list)):
+                        if len(ops1) < 6:
+                            ops1.append((op1, t1, v_val, v_c1))
+                        if len(ops1) < 6:
+                            ops1.append((op3, t2, v_val, v_c3))
+                    self.instrs.append({"valu": ops1})
 
-                combine_ops = [(op2, v_val, t1, t2) for (v_idx, v_val), t1, t2 in zip(vecs, tmp1_list, tmp2_list)]
-                self.instrs.append({"valu": combine_ops})
+                    remaining_tmp = []
+                    for i, ((v_idx, v_val), t1, t2) in enumerate(zip(vecs, tmp1_list, tmp2_list)):
+                        if i * 2 >= 6:
+                            remaining_tmp.append((op1, t1, v_val, v_c1))
+                        if i * 2 + 1 >= 6:
+                            remaining_tmp.append((op3, t2, v_val, v_c3))
+                    if remaining_tmp:
+                        self.instrs.append({"valu": remaining_tmp})
+
+                    combine_ops = [(op2, v_val, t1, t2) for (v_idx, v_val), t1, t2 in zip(vecs, tmp1_list, tmp2_list)]
+                    self.instrs.append({"valu": combine_ops})
 
             and_ops = [("&", t1, v_val, v_one) for (v_idx, v_val), t1 in zip(vecs, tmp1_list)]
             self.instrs.append({"valu": and_ops})
@@ -688,27 +725,36 @@ class KernelBuilder:
             xor_ops = [("^", v_val, v_val, t1) for (v_idx, v_val), t1 in zip(vecs, tmp1_list)]
             self.instrs.append({"valu": xor_ops})
 
+            # Hash (6 stages) - use multiply_add for stages 0, 2, 4
             for hi, (op1, val1, op2, op3, val3) in enumerate(HASH_STAGES):
                 v_c1, v_c3 = v_hash_consts[hi]
-                ops1 = []
-                for i, ((v_idx, v_val), t1, t2) in enumerate(zip(vecs, tmp1_list, tmp2_list)):
-                    if len(ops1) < 6:
-                        ops1.append((op1, t1, v_val, v_c1))
-                    if len(ops1) < 6:
-                        ops1.append((op3, t2, v_val, v_c3))
-                self.instrs.append({"valu": ops1})
 
-                remaining_tmp = []
-                for i, ((v_idx, v_val), t1, t2) in enumerate(zip(vecs, tmp1_list, tmp2_list)):
-                    if i * 2 >= 6:
-                        remaining_tmp.append((op1, t1, v_val, v_c1))
-                    if i * 2 + 1 >= 6:
-                        remaining_tmp.append((op3, t2, v_val, v_c3))
-                if remaining_tmp:
-                    self.instrs.append({"valu": remaining_tmp})
+                if hi in mul_add_stages:
+                    v_mul = mul_add_stages[hi]
+                    mul_add_ops = [("multiply_add", v_val, v_val, v_mul, v_c1) for (v_idx, v_val) in vecs]
+                    self.instrs.append({"valu": mul_add_ops[:6]})
+                    if len(mul_add_ops) > 6:
+                        self.instrs.append({"valu": mul_add_ops[6:]})
+                else:
+                    ops1 = []
+                    for i, ((v_idx, v_val), t1, t2) in enumerate(zip(vecs, tmp1_list, tmp2_list)):
+                        if len(ops1) < 6:
+                            ops1.append((op1, t1, v_val, v_c1))
+                        if len(ops1) < 6:
+                            ops1.append((op3, t2, v_val, v_c3))
+                    self.instrs.append({"valu": ops1})
 
-                combine_ops = [(op2, v_val, t1, t2) for (v_idx, v_val), t1, t2 in zip(vecs, tmp1_list, tmp2_list)]
-                self.instrs.append({"valu": combine_ops})
+                    remaining_tmp = []
+                    for i, ((v_idx, v_val), t1, t2) in enumerate(zip(vecs, tmp1_list, tmp2_list)):
+                        if i * 2 >= 6:
+                            remaining_tmp.append((op1, t1, v_val, v_c1))
+                        if i * 2 + 1 >= 6:
+                            remaining_tmp.append((op3, t2, v_val, v_c3))
+                    if remaining_tmp:
+                        self.instrs.append({"valu": remaining_tmp})
+
+                    combine_ops = [(op2, v_val, t1, t2) for (v_idx, v_val), t1, t2 in zip(vecs, tmp1_list, tmp2_list)]
+                    self.instrs.append({"valu": combine_ops})
 
             mul_idx_ops = [("*", v_idx, v_idx, v_two) for (v_idx, v_val) in vecs]
             self.instrs.append({"valu": mul_idx_ops})
@@ -820,17 +866,11 @@ class KernelBuilder:
                     ]
                 self.instrs.append({"load": load_ops, "valu": valu_ops})
 
-            h_stage = HASH_STAGES[4]
-            v_c1, v_c3 = v_hash_consts[4]
+            # Hash stages 4-5 - use multiply_add for stage 4
+            v_c1_4 = v_hash_consts[4][0]
             self.instrs.append({"valu": [
-                (h_stage[0], v_tmp1_a, v_val_prev_a, v_c1),
-                (h_stage[3], v_tmp2_a, v_val_prev_a, v_c3),
-                (h_stage[0], v_tmp1_b, v_val_prev_b, v_c1),
-                (h_stage[3], v_tmp2_b, v_val_prev_b, v_c3),
-            ]})
-            self.instrs.append({"valu": [
-                (h_stage[2], v_val_prev_a, v_tmp1_a, v_tmp2_a),
-                (h_stage[2], v_val_prev_b, v_tmp1_b, v_tmp2_b),
+                ("multiply_add", v_val_prev_a, v_val_prev_a, v_mul_9, v_c1_4),
+                ("multiply_add", v_val_prev_b, v_val_prev_b, v_mul_9, v_c1_4),
                 ("*", v_idx_prev_a, v_idx_prev_a, v_two),
                 ("*", v_idx_prev_b, v_idx_prev_b, v_two),
             ]})
@@ -877,16 +917,24 @@ class KernelBuilder:
             ("^", v_val_last2_a, v_val_last2_a, nv_last2_a),
             ("^", v_val_last2_b, v_val_last2_b, nv_last2_b),
         ]})
+        # Hash (6 stages) - use multiply_add for stages 0, 2, 4
         for hi, (op1, val1, op2, op3, val3) in enumerate(HASH_STAGES):
             v_c1, v_c3 = v_hash_consts[hi]
-            self.instrs.append({"valu": [
-                (op1, v_tmp1_a, v_val_last2_a, v_c1), (op3, v_tmp2_a, v_val_last2_a, v_c3),
-                (op1, v_tmp1_b, v_val_last2_b, v_c1), (op3, v_tmp2_b, v_val_last2_b, v_c3),
-            ]})
-            self.instrs.append({"valu": [
-                (op2, v_val_last2_a, v_tmp1_a, v_tmp2_a),
-                (op2, v_val_last2_b, v_tmp1_b, v_tmp2_b),
-            ]})
+            if hi in mul_add_stages:
+                v_mul = mul_add_stages[hi]
+                self.instrs.append({"valu": [
+                    ("multiply_add", v_val_last2_a, v_val_last2_a, v_mul, v_c1),
+                    ("multiply_add", v_val_last2_b, v_val_last2_b, v_mul, v_c1),
+                ]})
+            else:
+                self.instrs.append({"valu": [
+                    (op1, v_tmp1_a, v_val_last2_a, v_c1), (op3, v_tmp2_a, v_val_last2_a, v_c3),
+                    (op1, v_tmp1_b, v_val_last2_b, v_c1), (op3, v_tmp2_b, v_val_last2_b, v_c3),
+                ]})
+                self.instrs.append({"valu": [
+                    (op2, v_val_last2_a, v_tmp1_a, v_tmp2_a),
+                    (op2, v_val_last2_b, v_tmp1_b, v_tmp2_b),
+                ]})
         self.instrs.append({"valu": [
             ("&", v_tmp1_a, v_val_last2_a, v_one), ("*", v_idx_last2_a, v_idx_last2_a, v_two),
             ("&", v_tmp1_b, v_val_last2_b, v_one), ("*", v_idx_last2_b, v_idx_last2_b, v_two),
