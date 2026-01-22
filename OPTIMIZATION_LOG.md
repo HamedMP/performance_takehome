@@ -720,3 +720,78 @@ Still unclear. The breakthrough likely involves either:
 - Exploiting some property of the tree/hash we haven't identified
 - A novel scheduling technique
 
+---
+
+## BREAKTHROUGH ANALYSIS: Interleaved Round Processing
+
+**Date:** Current session
+
+**Key Discovery:**
+By splitting items into two groups and processing them at staggered rounds,
+we can overlap VALU work (selection phases) with LOAD work (gather phases)!
+
+**Current Problem:**
+- Selection phases (rounds 0-2, 11-13): 743 cycles, LOAD idle 90%
+- Gather phases (rounds 3-10, 14-15): 1450 cycles, both engines busy
+- Total: 2240 cycles
+
+**Interleave Strategy:**
+```
+Group A (128 items): R0 → R1 → R2 → R3 → R4 → ...
+Group B (128 items):           R0 → R1 → R2 → R3 → ...
+                     (starts when A reaches R3)
+```
+
+When Group A is at R3+ (gather, LOAD-heavy):
+- Group B is at R0-R2 (selection, VALU-only)
+- Potential overlap!
+
+**Detailed Analysis:**
+Per 18-cycle gather batch:
+- VALU capacity: 18 × 6 = 108 ops
+- Hash needs: ~36 ops
+- Available for selection: 72 ops
+- Selection batch needs: ~84 ops
+- Overflow: 12 ops = 3 extra cycles
+
+Per pair (gather round + selection round):
+- Sequential: 72 + 63 = 135 cycles
+- Interleaved: 72 + 9 = 81 cycles
+- Savings: 54 cycles per pair
+
+**Estimated Total with Interleave:**
+- Phase 1: Group A R0-R2 alone: 189 cycles
+- Phase 2: A R3-R10 + B R0-R2: 603 cycles (vs 576+189 sequential)
+- Phase 3: A R11-R13 + B R3-R7: 369 cycles
+- Phase 4: A R14-R15 + B R8-R15: 400 cycles
+- **Total: ~1561 cycles**
+
+**Potential Savings: ~679 cycles (30% reduction)**
+
+**Gap to Target:**
+- Interleaved: ~1561 cycles
+- Target: 1487 cycles
+- Remaining gap: 74 cycles (5%)
+
+**Implementation Challenges:**
+1. Complex scheduling between groups
+2. Register pressure (need vectors for both groups)
+3. Code size increase (more complex structure)
+4. VALU contention when both groups need hash
+
+**Additional Optimizations Needed:**
+To close the remaining 74-cycle gap:
+1. Micro-optimizations in constant loading (~30 cycles)
+2. Better pipelining in selection phases (~20 cycles)
+3. Loop overhead reduction (~24 cycles)
+
+---
+
+## Profiler Tools Added
+
+Created analysis tools:
+- `profiler.py` - Custom CLI profiler (summary, slots, timeline, bottleneck, pipeline, compare)
+- `analyze_phases.py` - Detailed breakdown of setup phases
+- `compute_efficiency.py` - Theoretical efficiency analysis
+- `interleave_analysis.py` - Interleaved processing potential
+
