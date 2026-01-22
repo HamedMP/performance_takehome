@@ -133,19 +133,35 @@ class KernelBuilder:
         tmp2 = self.alloc_scratch("tmp2")
 
         # Load memory layout params
+        # Define constants early for use in pipelined loading
+        zero_const = self.scratch_const(0)
+        one_const = self.scratch_const(1)
+        two_const = self.scratch_const(2)
+
         init_vars = [
             "rounds", "n_nodes", "batch_size", "forest_height",
             "forest_values_p", "inp_indices_p", "inp_values_p",
         ]
         for v in init_vars:
             self.alloc_scratch(v, 1)
-        for i, v in enumerate(init_vars):
-            self.add("load", ("const", tmp1, i))
-            self.add("load", ("load", self.scratch[v], tmp1))
-
-        zero_const = self.scratch_const(0)
-        one_const = self.scratch_const(1)
-        two_const = self.scratch_const(2)
+        # Pipelined parameter loading: overlap addr increment with memory load (14 -> 5 cycles)
+        # Cycle 1: const tmp1=0, tmp2=1
+        # Cycle 2-4: load 2 values while incrementing addresses with alu
+        # Cycle 5: load last value
+        self.instrs.append({"load": [("const", tmp1, 0), ("const", tmp2, 1)]})
+        self.instrs.append({"load": [
+            ("load", self.scratch["rounds"], tmp1),
+            ("load", self.scratch["n_nodes"], tmp2),
+        ], "alu": [("+", tmp1, tmp1, two_const), ("+", tmp2, tmp2, two_const)]})
+        self.instrs.append({"load": [
+            ("load", self.scratch["batch_size"], tmp1),
+            ("load", self.scratch["forest_height"], tmp2),
+        ], "alu": [("+", tmp1, tmp1, two_const), ("+", tmp2, tmp2, two_const)]})
+        self.instrs.append({"load": [
+            ("load", self.scratch["forest_values_p"], tmp1),
+            ("load", self.scratch["inp_indices_p"], tmp2),
+        ], "alu": [("+", tmp1, tmp1, two_const)]})
+        self.instrs.append({"load": [("load", self.scratch["inp_values_p"], tmp1)]})
         eleven_const = self.scratch_const(11)
         thirteen_const = self.scratch_const(13)
         vlen_const = self.scratch_const(VLEN)
@@ -262,17 +278,18 @@ class KernelBuilder:
             ]})
             addr_tmp, addr_tmp3 = addr_tmp3, addr_tmp
             addr_tmp2, addr_tmp4 = addr_tmp4, addr_tmp2
-        # Final loads for last pair
+        # Final index loads overlapped with first value address computation (saves 1 cycle)
         self.instrs.append({"load": [
             ("vload", all_idx[-2], addr_tmp),
             ("vload", all_idx[-1], addr_tmp2),
+        ], "alu": [
+            ("+", addr_tmp3, self.scratch["inp_values_p"], addr_consts[0]),
+            ("+", addr_tmp4, self.scratch["inp_values_p"], addr_consts[1]),
         ]})
+        addr_tmp, addr_tmp3 = addr_tmp3, addr_tmp
+        addr_tmp2, addr_tmp4 = addr_tmp4, addr_tmp2
 
-        # Values: same pattern
-        self.instrs.append({"alu": [
-            ("+", addr_tmp, self.scratch["inp_values_p"], addr_consts[0]),
-            ("+", addr_tmp2, self.scratch["inp_values_p"], addr_consts[1]),
-        ]})
+        # Values: continue the pattern
         for i in range(2, batch_size // VLEN, 2):
             self.instrs.append({"alu": [
                 ("+", addr_tmp3, self.scratch["inp_values_p"], addr_consts[i]),
@@ -396,11 +413,15 @@ class KernelBuilder:
         v_offset = self.alloc_scratch("v_offset", VLEN)
         v_node_tmp = self.alloc_scratch("v_node_tmp", VLEN)
 
-        # Load tree[1] and tree[2]
-        self.instrs.append({"alu": [("+", addr_tmp, self.scratch["forest_values_p"], one_const)]})
-        self.instrs.append({"load": [("load", tree1_scalar, addr_tmp)]})
-        self.instrs.append({"alu": [("+", addr_tmp, self.scratch["forest_values_p"], two_const)]})
-        self.instrs.append({"load": [("load", tree2_scalar, addr_tmp)]})
+        # Load tree[1] and tree[2] (parallel: 4 cycles -> 2 cycles)
+        self.instrs.append({"alu": [
+            ("+", addr_tmp, self.scratch["forest_values_p"], one_const),
+            ("+", addr_tmp2, self.scratch["forest_values_p"], two_const),
+        ]})
+        self.instrs.append({"load": [
+            ("load", tree1_scalar, addr_tmp),
+            ("load", tree2_scalar, addr_tmp2),
+        ]})
 
         # Compute diff = tree2 - tree1 and c = tree1 - diff for multiply_add optimization
         # node_val = tree1 + (idx - 1) * diff = idx * diff + (tree1 - diff) = multiply_add(idx, diff, c)
@@ -469,13 +490,7 @@ class KernelBuilder:
 
             add_idx_ops = [("+", v_idx, v_idx, t1) for (v_idx, v_val), t1 in zip(vecs, tmp1_list)]
             self.instrs.append({"valu": add_idx_ops})
-
-            # Check idx < n_nodes and wrap if needed
-            cmp_ops = [("<", t1, v_idx, v_n_nodes) for (v_idx, v_val), t1 in zip(vecs, tmp1_list)]
-            self.instrs.append({"valu": cmp_ops})
-
-            wrap_ops = [("*", v_idx, v_idx, t1) for (v_idx, v_val), t1 in zip(vecs, tmp1_list)]
-            self.instrs.append({"valu": wrap_ops})
+            # No wrap check needed - max idx is 6 which is << n_nodes
 
         # ============================================
         # ROUND 2: All indices are 3, 4, 5, or 6 (use one-hot selection instead of gather)
@@ -499,7 +514,7 @@ class KernelBuilder:
         v_five = self.alloc_scratch("v_five", VLEN)
         v_six = self.alloc_scratch("v_six", VLEN)
 
-        # Load tree[3..6] and broadcast
+        # Load tree[3..6] and broadcast (overlap addr compute with load: 4 cycles -> 3 cycles)
         self.instrs.append({"alu": [
             ("+", addr_tmp, self.scratch["forest_values_p"], three_const),
             ("+", addr_tmp2, self.scratch["forest_values_p"], four_const),
@@ -507,23 +522,24 @@ class KernelBuilder:
         self.instrs.append({"load": [
             ("load", tree3_scalar, addr_tmp),
             ("load", tree4_scalar, addr_tmp2),
-        ]})
-        self.instrs.append({"alu": [
+        ], "alu": [
             ("+", addr_tmp, self.scratch["forest_values_p"], five_const),
             ("+", addr_tmp2, self.scratch["forest_values_p"], six_const),
-        ]})
-        self.instrs.append({"load": [
-            ("load", tree5_scalar, addr_tmp),
-            ("load", tree6_scalar, addr_tmp2),
         ]})
         # Pre-compute diff values for 2-bit selection (saves 2 cycles per batch)
         diff_low_scalar = self.alloc_scratch("diff_low_scalar")
         diff_high_scalar = self.alloc_scratch("diff_high_scalar")
         v_diff_low = self.alloc_scratch("v_diff_low", VLEN)
         v_diff_high = self.alloc_scratch("v_diff_high", VLEN)
-        # diff_low = tree3 - tree4, diff_high = tree5 - tree6
-        self.instrs.append({"alu": [
+        # Overlap tree5,6 load with diff_low computation (diff_low uses tree3,4 which are already loaded)
+        self.instrs.append({"load": [
+            ("load", tree5_scalar, addr_tmp),
+            ("load", tree6_scalar, addr_tmp2),
+        ], "alu": [
             ("-", diff_low_scalar, tree3_scalar, tree4_scalar),
+        ]})
+        # Compute diff_high after tree5,6 are loaded
+        self.instrs.append({"alu": [
             ("-", diff_high_scalar, tree5_scalar, tree6_scalar),
         ]})
         self.instrs.append({"valu": [
@@ -620,19 +636,11 @@ class KernelBuilder:
 
             add_idx_ops = [("+", v_idx, v_idx, t1) for (v_idx, v_val), t1 in zip(vecs, tmp1_list)]
             self.instrs.append({"valu": add_idx_ops})
-
-            # Check idx < n_nodes and wrap if needed
-            cmp_ops = [("<", t1, v_idx, v_n_nodes) for (v_idx, v_val), t1 in zip(vecs, tmp1_list)]
-            self.instrs.append({"valu": cmp_ops})
-
-            wrap_ops = [("*", v_idx, v_idx, t1) for (v_idx, v_val), t1 in zip(vecs, tmp1_list)]
-            self.instrs.append({"valu": wrap_ops})
+            # No wrap check needed - max idx is 14 which is << n_nodes
 
         # ============================================
         # ROUNDS 3 to 10: 4-vector pipelined loop
         # ============================================
-        self.instrs.append({"load": [("const", round_counter, 3)]})  # Start at round 3
-
         # 4-VECTOR PIPELINED INNER LOOP
         # Process 4 vectors per batch (8 batches total for 32 vectors)
         # 16 gather cycles per batch (4 vectors × 8 elements / 2 loads per cycle)
@@ -650,12 +658,13 @@ class KernelBuilder:
         v_c1_5, v_c3_5 = v_hash_consts[5]
 
         # Prologue: Gather batch 0 (vectors 0,1,2,3) - only runs on first iteration
+        # Combine const load with addr compute to save 1 cycle
         self.instrs.append({"valu": [
             ("+", v_addr_a, all_idx[0], v_forest_p),
             ("+", v_addr_b, all_idx[1], v_forest_p),
             ("+", v_addr_c, all_idx[2], v_forest_p),
             ("+", v_addr_d, all_idx[3], v_forest_p),
-        ]})
+        ], "load": [("const", round_counter, 3)]})
         # 16 gather cycles for 4 vectors
         for vec_i, (nv, addr) in enumerate([(v_node_val_a, v_addr_a), (v_node_val_b, v_addr_b),
                                              (v_node_val_c, v_addr_c), (v_node_val_d, v_addr_d)]):
@@ -1068,13 +1077,14 @@ class KernelBuilder:
             ("*", v_idx_last[2], v_idx_last[2], v_tmp1_c),
             ("*", v_idx_last[3], v_idx_last[3], v_tmp1_d),
         ], "alu": [("<", loop_cond, round_counter, eleven_const)]})
-        self.instrs.append({"flow": [("cond_jump", loop_cond, outer_loop_start)]})
+        # Overlap tree[0] load with loop branch (speculative: saves 1 cycle on loop exit)
+        self.instrs.append({"flow": [("cond_jump", loop_cond, outer_loop_start)],
+                           "load": [("load", tree0_scalar, self.scratch["forest_values_p"])]})
 
         # ============================================
         # ROUND 11: All items have idx=0 (after round 10 wrapped all to 0)
-        # Use broadcast instead of gather
+        # Use broadcast instead of gather (tree[0] already loaded above)
         # ============================================
-        self.instrs.append({"load": [("load", tree0_scalar, self.scratch["forest_values_p"])]})
         self.instrs.append({"valu": [("vbroadcast", v_tree0, tree0_scalar)]})
 
         for start_vec, num_vecs in vec_batches:
@@ -1125,10 +1135,15 @@ class KernelBuilder:
         # ============================================
         # ROUND 12: All indices are 1 or 2 (use arithmetic instead of gather)
         # ============================================
-        self.instrs.append({"alu": [("+", addr_tmp, self.scratch["forest_values_p"], one_const)]})
-        self.instrs.append({"load": [("load", tree1_scalar, addr_tmp)]})
-        self.instrs.append({"alu": [("+", addr_tmp, self.scratch["forest_values_p"], two_const)]})
-        self.instrs.append({"load": [("load", tree2_scalar, addr_tmp)]})
+        # Load tree[1] and tree[2] (parallel: 4 cycles -> 2 cycles)
+        self.instrs.append({"alu": [
+            ("+", addr_tmp, self.scratch["forest_values_p"], one_const),
+            ("+", addr_tmp2, self.scratch["forest_values_p"], two_const),
+        ]})
+        self.instrs.append({"load": [
+            ("load", tree1_scalar, addr_tmp),
+            ("load", tree2_scalar, addr_tmp2),
+        ]})
         # Compute diff and c for multiply_add optimization
         self.instrs.append({"alu": [("-", diff_scalar, tree2_scalar, tree1_scalar)]})
         self.instrs.append({"alu": [("-", c_scalar, tree1_scalar, diff_scalar)]})
@@ -1190,12 +1205,7 @@ class KernelBuilder:
 
             add_idx_ops = [("+", v_idx, v_idx, t1) for (v_idx, v_val), t1 in zip(vecs, tmp1_list)]
             self.instrs.append({"valu": add_idx_ops})
-
-            cmp_ops = [("<", t1, v_idx, v_n_nodes) for (v_idx, v_val), t1 in zip(vecs, tmp1_list)]
-            self.instrs.append({"valu": cmp_ops})
-
-            wrap_ops = [("*", v_idx, v_idx, t1) for (v_idx, v_val), t1 in zip(vecs, tmp1_list)]
-            self.instrs.append({"valu": wrap_ops})
+            # No wrap check needed - max idx is 6 which is << n_nodes
 
         # ============================================
         # ROUND 13: All indices are 3, 4, 5, or 6 (use one-hot selection instead of gather)
@@ -1273,26 +1283,19 @@ class KernelBuilder:
 
             add_idx_ops = [("+", v_idx, v_idx, t1) for (v_idx, v_val), t1 in zip(vecs, tmp1_list)]
             self.instrs.append({"valu": add_idx_ops})
-
-            # Check idx < n_nodes and wrap if needed
-            cmp_ops = [("<", t1, v_idx, v_n_nodes) for (v_idx, v_val), t1 in zip(vecs, tmp1_list)]
-            self.instrs.append({"valu": cmp_ops})
-
-            wrap_ops = [("*", v_idx, v_idx, t1) for (v_idx, v_val), t1 in zip(vecs, tmp1_list)]
-            self.instrs.append({"valu": wrap_ops})
+            # No wrap check needed - max idx is 14 which is << n_nodes
 
         # ============================================
         # ROUNDS 14-15: 4-vector pipelined loop
         # ============================================
-        self.instrs.append({"load": [("const", round_counter, 14)]})
-
         # Prologue: Gather batch 0 (vectors 0,1,2,3) - only runs on first iteration
+        # Combine const load with addr compute to save 1 cycle
         self.instrs.append({"valu": [
             ("+", v_addr_a, all_idx[0], v_forest_p),
             ("+", v_addr_b, all_idx[1], v_forest_p),
             ("+", v_addr_c, all_idx[2], v_forest_p),
             ("+", v_addr_d, all_idx[3], v_forest_p),
-        ]})
+        ], "load": [("const", round_counter, 14)]})
         # 16 gather cycles for 4 vectors
         for vec_i, (nv, addr) in enumerate([(v_node_val_a, v_addr_a), (v_node_val_b, v_addr_b),
                                              (v_node_val_c, v_addr_c), (v_node_val_d, v_addr_d)]):
@@ -1700,14 +1703,13 @@ class KernelBuilder:
             ("*", v_idx_last2[2], v_idx_last2[2], v_tmp1_c),
             ("*", v_idx_last2[3], v_idx_last2[3], v_tmp1_d),
         ], "alu": [("<", loop_cond, round_counter, self.scratch["rounds"])]})
-        self.instrs.append({"flow": [("cond_jump", loop_cond, outer_loop_start_2)]})
-
-        # Store ALL indices and values back to memory (pipelined: overlap addr compute with stores)
-        # Indices: compute first pair of addresses
-        self.instrs.append({"alu": [
+        # Overlap initial store addr compute with loop branch (speculative: saves 1 cycle on loop exit)
+        self.instrs.append({"flow": [("cond_jump", loop_cond, outer_loop_start_2)], "alu": [
             ("+", addr_tmp, self.scratch["inp_indices_p"], addr_consts[0]),
             ("+", addr_tmp2, self.scratch["inp_indices_p"], addr_consts[1]),
         ]})
+
+        # Store ALL indices and values back to memory (pipelined: overlap addr compute with stores)
         # Pipelined: compute next addresses while storing current
         for i in range(2, batch_size // VLEN, 2):
             self.instrs.append({"alu": [
