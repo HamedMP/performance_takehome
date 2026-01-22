@@ -247,62 +247,63 @@ class KernelBuilder:
         self.instrs.append({"valu": [("vbroadcast", v_tree0, tree0_scalar)]})
 
         # Process all batches for round 0 (no gathers needed!)
-        # Pack 4 vectors (2 batches) at a time for better valu utilization
+        # Pack 6 vectors at a time for better valu utilization (6 valu slots)
         v_tmp1_c = self.alloc_scratch("v_tmp1_c", VLEN)
         v_tmp1_d = self.alloc_scratch("v_tmp1_d", VLEN)
+        v_tmp1_e = self.alloc_scratch("v_tmp1_e", VLEN)
+        v_tmp1_f = self.alloc_scratch("v_tmp1_f", VLEN)
         v_tmp2_c = self.alloc_scratch("v_tmp2_c", VLEN)
         v_tmp2_d = self.alloc_scratch("v_tmp2_d", VLEN)
-        v_tmp3_c = self.alloc_scratch("v_tmp3_c", VLEN)
-        v_tmp3_d = self.alloc_scratch("v_tmp3_d", VLEN)
+        v_tmp2_e = self.alloc_scratch("v_tmp2_e", VLEN)
+        v_tmp2_f = self.alloc_scratch("v_tmp2_f", VLEN)
 
-        for batch in range(0, NUM_BATCHES, 2):
-            ia, ib = batch * 2, batch * 2 + 1
-            ic, id = (batch + 1) * 2, (batch + 1) * 2 + 1
-            v_idx_a, v_val_a = all_idx[ia], all_val[ia]
-            v_idx_b, v_val_b = all_idx[ib], all_val[ib]
-            v_idx_c, v_val_c = all_idx[ic], all_val[ic]
-            v_idx_d, v_val_d = all_idx[id], all_val[id]
+        # Process 6 vectors (48 items) at a time for better valu utilization
+        # 32 vectors / 6 = 5.33, so process in chunks: 6, 6, 6, 6, 6, 2
+        vec_batches = [(0, 6), (6, 6), (12, 6), (18, 6), (24, 6), (30, 2)]
 
-            # XOR with tree[0] (4 vectors)
-            self.instrs.append({"valu": [
-                ("^", v_val_a, v_val_a, v_tree0),
-                ("^", v_val_b, v_val_b, v_tree0),
-                ("^", v_val_c, v_val_c, v_tree0),
-                ("^", v_val_d, v_val_d, v_tree0),
-            ]})
+        for start_vec, num_vecs in vec_batches:
+            vecs = [(all_idx[i], all_val[i]) for i in range(start_vec, start_vec + num_vecs)]
+            tmp1_list = [v_tmp1_a, v_tmp1_b, v_tmp1_c, v_tmp1_d, v_tmp1_e, v_tmp1_f][:num_vecs]
+            tmp2_list = [v_tmp2_a, v_tmp2_b, v_tmp2_c, v_tmp2_d, v_tmp2_e, v_tmp2_f][:num_vecs]
 
-            # Hash (6 stages) - process 4 vectors with 6 valu slots
+            # XOR with tree[0]
+            xor_ops = [("^", v_val, v_val, v_tree0) for v_idx, v_val in vecs]
+            self.instrs.append({"valu": xor_ops})
+
+            # Hash (6 stages)
             for hi, (op1, val1, op2, op3, val3) in enumerate(HASH_STAGES):
                 v_c1, v_c3 = v_hash_consts[hi]
-                # First cycle: tmp1 and tmp2 for all 4 vectors (but only 6 slots!)
-                # Split: 4 tmp1 ops + 2 tmp2 ops in cycle 1
-                self.instrs.append({"valu": [
-                    (op1, v_tmp1_a, v_val_a, v_c1), (op1, v_tmp1_b, v_val_b, v_c1),
-                    (op1, v_tmp1_c, v_val_c, v_c1), (op1, v_tmp1_d, v_val_d, v_c1),
-                    (op3, v_tmp2_a, v_val_a, v_c3), (op3, v_tmp2_b, v_val_b, v_c3),
-                ]})
-                # Remaining tmp2 + final combine for a,b
-                self.instrs.append({"valu": [
-                    (op3, v_tmp2_c, v_val_c, v_c3), (op3, v_tmp2_d, v_val_d, v_c3),
-                    (op2, v_val_a, v_tmp1_a, v_tmp2_a),
-                    (op2, v_val_b, v_tmp1_b, v_tmp2_b),
-                ]})
-                # Final combine for c,d
-                self.instrs.append({"valu": [
-                    (op2, v_val_c, v_tmp1_c, v_tmp2_c),
-                    (op2, v_val_d, v_tmp1_d, v_tmp2_d),
-                ]})
+                # tmp1 and tmp2 can be computed in parallel
+                # Cycle 1: interleave tmp1 and tmp2 ops
+                ops1 = []
+                for i, ((v_idx, v_val), t1, t2) in enumerate(zip(vecs, tmp1_list, tmp2_list)):
+                    if len(ops1) < 6:
+                        ops1.append((op1, t1, v_val, v_c1))
+                    if len(ops1) < 6:
+                        ops1.append((op3, t2, v_val, v_c3))
+                self.instrs.append({"valu": ops1})
 
-            # Index computation: idx=0, so new_idx = 0*2 + (1 or 2) = 1 or 2
-            # Simplified: new_idx = 1 + (val & 1)
-            self.instrs.append({"valu": [
-                ("&", v_tmp1_a, v_val_a, v_one), ("&", v_tmp1_b, v_val_b, v_one),
-                ("&", v_tmp1_c, v_val_c, v_one), ("&", v_tmp1_d, v_val_d, v_one),
-            ]})
-            self.instrs.append({"valu": [
-                ("+", v_idx_a, v_one, v_tmp1_a), ("+", v_idx_b, v_one, v_tmp1_b),
-                ("+", v_idx_c, v_one, v_tmp1_c), ("+", v_idx_d, v_one, v_tmp1_d),
-            ]})
+                # Remaining tmp ops + val combine
+                remaining_tmp = []
+                for i, ((v_idx, v_val), t1, t2) in enumerate(zip(vecs, tmp1_list, tmp2_list)):
+                    if i * 2 >= 6:  # Not covered in first cycle
+                        remaining_tmp.append((op1, t1, v_val, v_c1))
+                    if i * 2 + 1 >= 6:
+                        remaining_tmp.append((op3, t2, v_val, v_c3))
+
+                if remaining_tmp:
+                    self.instrs.append({"valu": remaining_tmp})
+
+                # Final combine: val = op2(tmp1, tmp2)
+                combine_ops = [(op2, v_val, t1, t2) for (v_idx, v_val), t1, t2 in zip(vecs, tmp1_list, tmp2_list)]
+                self.instrs.append({"valu": combine_ops})
+
+            # Index computation: idx=0, so new_idx = 0*2 + (1 or 2) = 1 + (val & 1)
+            and_ops = [("&", t1, v_val, v_one) for (v_idx, v_val), t1 in zip(vecs, tmp1_list)]
+            self.instrs.append({"valu": and_ops})
+
+            add_ops = [("+", v_idx, v_one, t1) for (v_idx, v_val), t1 in zip(vecs, tmp1_list)]
+            self.instrs.append({"valu": add_ops})
             # No wrapping check needed since 1 and 2 are < n_nodes
 
         # ============================================
