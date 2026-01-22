@@ -256,3 +256,114 @@ Round | Unique Indices | Max Index
 - Reverted to working version (4998 cycles)
 
 **Key Learning:** Complex refactoring needs more careful testing. The current pipelined structure is fragile and hard to modify without introducing bugs.
+
+---
+
+## Experiment 12: Round 0 Broadcast (Separate Processing)
+
+**What I did:**
+- Process round 0 separately before the main loop
+- Load tree[0] once, broadcast to vector
+- Use 6-vector batches for better valu utilization
+- Eliminates all gathers for round 0
+
+**Result:** 4,868 cycles (30.3x speedup)
+
+**Analysis:**
+- Saved ~130 cycles by eliminating round 0 gathers
+- 6-vector processing better utilizes 6 valu slots per cycle
+
+---
+
+## Experiment 13: Round 1 Arithmetic (No Gathers)
+
+**What I did:**
+- After round 0, all indices are 1 or 2
+- Load tree[1] and tree[2], compute diff = tree[2] - tree[1]
+- For each vector: node_val = tree[1] + (idx-1) * diff
+- Eliminates all gathers for round 1
+
+**Result:** 4,688 cycles (31.5x speedup, saved 180 cycles from 4,868)
+
+**Analysis:**
+- Arithmetic approach works well for 2 unique indices
+- No pipelining overlap needed since computation is cheap
+- Total savings from rounds 0+1: ~310 cycles
+
+---
+
+## Experiment 14: Round 2 Arithmetic (FAILED - No Improvement)
+
+**What I did:**
+- Tried 2-bit selection for indices {3, 4, 5, 6}
+- Preload tree[3..6], compute deltas for bilinear interpolation
+- node_val = tree3 + bit0*d01 + bit1*d10 + bit0*bit1*d11
+
+**Result:** 4,691 cycles (WORSE than 4,688)
+
+**Analysis:**
+- The arithmetic overhead (bit extraction, multiplications, additions) is more expensive than gather
+- The gather-hash overlap in the pipelined approach is very efficient
+- For more than 2 unique indices, arithmetic approach doesn't help
+
+**Key Learning:** Arithmetic elimination of gathers only works for rounds with 2 or fewer unique indices (rounds 0, 1, 10, 11).
+
+---
+
+## Results Summary (Updated)
+
+| Experiment | Cycles | Speedup vs Baseline | Notes |
+|------------|--------|---------------------|-------|
+| Baseline   | 147,734 | 1.00x | - |
+| Exp 12: Round 0 broadcast | 4,868 | 30.3x | -130 cycles |
+| Exp 13: Round 1 arithmetic | 4,688 | 31.5x | -180 cycles |
+| Exp 14: Round 2 arithmetic | 4,691 | FAILED | +3 cycles |
+
+---
+
+## Experiment 15: Rounds 10 and 11 Restructuring (FAILED)
+
+**What I did:**
+- Attempted to restructure kernel with two loops (2-9 and 12-15)
+- Added special handling for rounds 10 and 11 between loops
+- Used jump instructions to skip sections based on rounds parameter
+
+**Result:** Correctness failure on round 1
+
+**Analysis:**
+- Complex restructuring with jump fixups introduced bugs
+- Variable scoping issues with v_diff, v_tree1 used in round 11
+- The pipelined structure is fragile and hard to modify
+
+---
+
+## Current State Summary
+
+**Best Result:** 4,688 cycles (31.5x speedup from 147,734 baseline)
+
+**What Works:**
+- Round 0: Broadcast instead of gather (~130 cycles saved)
+- Round 1: Arithmetic instead of gather (~180 cycles saved)
+- Rounds 2+: Pipelined gather/hash overlap
+
+**What Doesn't Work:**
+- Round 2+ arithmetic: More expensive than pipelined gathers
+- Complex restructuring: Too error-prone
+
+**Remaining Gap:**
+- Current: 4,688 cycles
+- Target: 1,487 cycles
+- Need: 3.2x additional improvement
+
+**Bottleneck Analysis:**
+- Gather: 8 cycles per batch (limited by 2 loads/cycle)
+- Hash: 12 cycles per batch (8 overlapped with gather)
+- Index: 5 cycles per batch (dependency chain)
+- Per batch total: ~17-18 cycles
+- Per round: ~310 cycles × 14 rounds = 4,340 cycles
+
+**To Reach Target:**
+Would need to eliminate gathers for most rounds, which requires either:
+1. Arithmetic computation for rounds 2-9 (didn't work - too expensive)
+2. Fundamentally different algorithm
+3. Process more items per cycle (limited by hardware)
