@@ -364,6 +364,111 @@ Round | Unique Indices | Max Index
 
 ---
 
+## Experiment 15: Hash multiply_add optimization - 4,038 cycles
+
+**What I did:**
+- Discovered that hash stages 0, 2, 4 have the form: val = (val + c1) + (val << shift)
+- This equals: val = val * (1 + 2^shift) + c1, which is a multiply_add operation!
+- Pre-computed multipliers: 4097 (stage 0), 33 (stage 2), 9 (stage 4)
+- Used multiply_add instruction for these stages (1 cycle instead of 2)
+
+**Result:** 4,038 cycles (36.6x speedup)
+
+**Analysis:**
+- Saved 343 cycles from 4,381
+- Each multiply_add stage saves 1 cycle
+- Applied to rounds 0, 1, 11, 12 (non-pipelined) and pipelined loop epilogues
+
+---
+
+## Experiment 16: Restructure pipelined hash - 3,678 cycles
+
+**What I did:**
+- Restructured pipelined hash to fit stages 0-5 within gather window:
+  - gi=0: gather A[0,1], stage 0 (multiply_add)
+  - gi=1: gather A[2,3], stage 1 part 1
+  - gi=2: gather A[4,5], stage 1 part 2
+  - gi=3: gather A[6,7], stage 2 (multiply_add)
+  - gi=4: gather B[0,1], stage 3 part 1
+  - gi=5: gather B[2,3], stage 3 part 2
+  - gi=6: gather B[4,5], stage 4 (multiply_add) + idx*2
+  - gi=7: gather B[6,7], stage 5 part 1
+- Only stage 5 part 2 remains outside gather overlap
+
+**Result:** 3,678 cycles (40.2x speedup)
+
+**Analysis:**
+- Pulled stage 4 and 5 part 1 into gather overlap window
+- Saved ~1 cycle per batch in steady state
+- Total savings: 360 cycles
+
+---
+
+## Experiment 17: Merge loop control with epilogue - 3,654 cycles
+
+**What I did:**
+- Merged scalar ALU loop control operations with vector epilogue operations
+- Round increment merged with index comparison cycle
+- Loop condition merged with index wrap cycle
+
+**Result:** 3,654 cycles (40.4x speedup)
+
+**Analysis:**
+- Saved 24 cycles by using unused ALU slots in VALU cycles
+
+---
+
+## Experiment 18: Pipelined loads/stores - 3,594 cycles
+
+**What I did:**
+- Overlap address computation with load/store operations
+- Compute next pair of addresses while performing current loads/stores
+- Added 2 extra address registers for pipelining
+
+**Result:** 3,594 cycles (41.1x speedup)
+
+**Analysis:**
+- Saved ~60 cycles (30 for initial loads, 30 for final stores)
+
+---
+
+## Results Summary (Final)
+
+| Experiment | Cycles | Speedup vs Baseline | Notes |
+|------------|--------|---------------------|-------|
+| Baseline   | 147,734 | 1.00x | - |
+| Exp 16: Rounds 11-12 opt | 4,381 | 33.7x | -307 cycles |
+| Exp 15: multiply_add | 4,038 | 36.6x | -343 cycles |
+| Exp 16: Restructure pipelined | 3,678 | 40.2x | -360 cycles |
+| Exp 17: Loop control merge | 3,654 | 40.4x | -24 cycles |
+| Exp 18: Pipelined loads/stores | 3,594 | 41.1x | -60 cycles |
+
+---
+
+## Current State Summary (Final)
+
+**Best Result:** 3,594 cycles (41.1x speedup from 147,734 baseline)
+
+**Key Optimizations Applied:**
+1. Rounds 0, 11: Broadcast instead of gather (single unique index)
+2. Rounds 1, 12: Arithmetic instead of gather (2 unique indices)
+3. multiply_add for hash stages 0, 2, 4
+4. Restructured pipelined hash to maximize gather overlap
+5. Merged loop control ALU with epilogue VALU
+6. Pipelined loads/stores with overlapped address computation
+
+**Remaining Gap:**
+- Current: 3,594 cycles
+- Target: 1,487 cycles
+- Need: 2.4x additional improvement
+
+**Theoretical Analysis:**
+- 12 gather rounds × 128 cycles minimum = 1,536 cycles for gathers alone
+- Target 1,487 < 1,536, suggesting the target requires fundamentally different approach
+- Current approach is likely near its theoretical limit
+
+---
+
 ## Experiment 16: Rounds 11-12 Optimization
 
 **What I did:**
