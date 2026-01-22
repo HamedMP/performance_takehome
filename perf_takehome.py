@@ -192,6 +192,9 @@ class KernelBuilder:
         round_counter = self.alloc_scratch("round_counter")
         loop_cond = self.alloc_scratch("loop_cond")
         addr_tmp = self.alloc_scratch("addr_tmp")
+        # Additional address registers for pipelined stores
+        addr_tmp3 = self.alloc_scratch("addr_tmp3")
+        addr_tmp4 = self.alloc_scratch("addr_tmp4")
 
         self.add("flow", ("pause",))
 
@@ -225,26 +228,48 @@ class KernelBuilder:
         addr_consts = [self.scratch_const(i * VLEN) for i in range(batch_size // VLEN)]
         addr_tmp2 = self.alloc_scratch("addr_tmp2")
 
-        # Load ALL indices and values into scratch (optimized: 2 vloads per cycle)
-        # First compute both addresses, then do 2 vloads
-        for i in range(0, batch_size // VLEN, 2):
+        # Load ALL indices and values into scratch (pipelined: overlap addr compute with loads)
+        # Indices: compute first pair of addresses
+        self.instrs.append({"alu": [
+            ("+", addr_tmp, self.scratch["inp_indices_p"], addr_consts[0]),
+            ("+", addr_tmp2, self.scratch["inp_indices_p"], addr_consts[1]),
+        ]})
+        # Pipelined: compute next addresses while loading current
+        for i in range(2, batch_size // VLEN, 2):
             self.instrs.append({"alu": [
-                ("+", addr_tmp, self.scratch["inp_indices_p"], addr_consts[i]),
-                ("+", addr_tmp2, self.scratch["inp_indices_p"], addr_consts[i+1]),
+                ("+", addr_tmp3, self.scratch["inp_indices_p"], addr_consts[i]),
+                ("+", addr_tmp4, self.scratch["inp_indices_p"], addr_consts[i+1]),
+            ], "load": [
+                ("vload", all_idx[i-2], addr_tmp),
+                ("vload", all_idx[i-1], addr_tmp2),
             ]})
-            self.instrs.append({"load": [
-                ("vload", all_idx[i], addr_tmp),
-                ("vload", all_idx[i+1], addr_tmp2),
-            ]})
-        for i in range(0, batch_size // VLEN, 2):
+            addr_tmp, addr_tmp3 = addr_tmp3, addr_tmp
+            addr_tmp2, addr_tmp4 = addr_tmp4, addr_tmp2
+        # Final loads for last pair
+        self.instrs.append({"load": [
+            ("vload", all_idx[-2], addr_tmp),
+            ("vload", all_idx[-1], addr_tmp2),
+        ]})
+
+        # Values: same pattern
+        self.instrs.append({"alu": [
+            ("+", addr_tmp, self.scratch["inp_values_p"], addr_consts[0]),
+            ("+", addr_tmp2, self.scratch["inp_values_p"], addr_consts[1]),
+        ]})
+        for i in range(2, batch_size // VLEN, 2):
             self.instrs.append({"alu": [
-                ("+", addr_tmp, self.scratch["inp_values_p"], addr_consts[i]),
-                ("+", addr_tmp2, self.scratch["inp_values_p"], addr_consts[i+1]),
+                ("+", addr_tmp3, self.scratch["inp_values_p"], addr_consts[i]),
+                ("+", addr_tmp4, self.scratch["inp_values_p"], addr_consts[i+1]),
+            ], "load": [
+                ("vload", all_val[i-2], addr_tmp),
+                ("vload", all_val[i-1], addr_tmp2),
             ]})
-            self.instrs.append({"load": [
-                ("vload", all_val[i], addr_tmp),
-                ("vload", all_val[i+1], addr_tmp2),
-            ]})
+            addr_tmp, addr_tmp3 = addr_tmp3, addr_tmp
+            addr_tmp2, addr_tmp4 = addr_tmp4, addr_tmp2
+        self.instrs.append({"load": [
+            ("vload", all_val[-2], addr_tmp),
+            ("vload", all_val[-1], addr_tmp2),
+        ]})
 
         # We need separate node_val registers for pipelining (double buffering)
         v_node_val_a2 = self.alloc_scratch("v_node_val_a2", VLEN)
@@ -988,25 +1013,49 @@ class KernelBuilder:
         ], "alu": [("<", loop_cond, round_counter, self.scratch["rounds"])]})
         self.instrs.append({"flow": [("cond_jump", loop_cond, outer_loop_start_2)]})
 
-        # Store ALL indices and values back to memory (optimized: 2 vstores per cycle)
-        for i in range(0, batch_size // VLEN, 2):
+        # Store ALL indices and values back to memory (pipelined: overlap addr compute with stores)
+        # Indices: compute first pair of addresses
+        self.instrs.append({"alu": [
+            ("+", addr_tmp, self.scratch["inp_indices_p"], addr_consts[0]),
+            ("+", addr_tmp2, self.scratch["inp_indices_p"], addr_consts[1]),
+        ]})
+        # Pipelined: compute next addresses while storing current
+        for i in range(2, batch_size // VLEN, 2):
             self.instrs.append({"alu": [
-                ("+", addr_tmp, self.scratch["inp_indices_p"], addr_consts[i]),
-                ("+", addr_tmp2, self.scratch["inp_indices_p"], addr_consts[i+1]),
+                ("+", addr_tmp3, self.scratch["inp_indices_p"], addr_consts[i]),
+                ("+", addr_tmp4, self.scratch["inp_indices_p"], addr_consts[i+1]),
+            ], "store": [
+                ("vstore", addr_tmp, all_idx[i-2]),
+                ("vstore", addr_tmp2, all_idx[i-1]),
             ]})
-            self.instrs.append({"store": [
-                ("vstore", addr_tmp, all_idx[i]),
-                ("vstore", addr_tmp2, all_idx[i+1]),
-            ]})
-        for i in range(0, batch_size // VLEN, 2):
+            # Swap address registers
+            addr_tmp, addr_tmp3 = addr_tmp3, addr_tmp
+            addr_tmp2, addr_tmp4 = addr_tmp4, addr_tmp2
+        # Final stores for last pair
+        self.instrs.append({"store": [
+            ("vstore", addr_tmp, all_idx[-2]),
+            ("vstore", addr_tmp2, all_idx[-1]),
+        ]})
+
+        # Values: same pattern
+        self.instrs.append({"alu": [
+            ("+", addr_tmp, self.scratch["inp_values_p"], addr_consts[0]),
+            ("+", addr_tmp2, self.scratch["inp_values_p"], addr_consts[1]),
+        ]})
+        for i in range(2, batch_size // VLEN, 2):
             self.instrs.append({"alu": [
-                ("+", addr_tmp, self.scratch["inp_values_p"], addr_consts[i]),
-                ("+", addr_tmp2, self.scratch["inp_values_p"], addr_consts[i+1]),
+                ("+", addr_tmp3, self.scratch["inp_values_p"], addr_consts[i]),
+                ("+", addr_tmp4, self.scratch["inp_values_p"], addr_consts[i+1]),
+            ], "store": [
+                ("vstore", addr_tmp, all_val[i-2]),
+                ("vstore", addr_tmp2, all_val[i-1]),
             ]})
-            self.instrs.append({"store": [
-                ("vstore", addr_tmp, all_val[i]),
-                ("vstore", addr_tmp2, all_val[i+1]),
-            ]})
+            addr_tmp, addr_tmp3 = addr_tmp3, addr_tmp
+            addr_tmp2, addr_tmp4 = addr_tmp4, addr_tmp2
+        self.instrs.append({"store": [
+            ("vstore", addr_tmp, all_val[-2]),
+            ("vstore", addr_tmp2, all_val[-1]),
+        ]})
 
         self.instrs.append({"flow": [("pause",)]})
 
