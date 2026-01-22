@@ -127,3 +127,20 @@
 | Exp 6: Register persistence | 7,385 | 20.0x | 1.19x |
 | Exp 7: Optimized load/store | 7,158 | 20.6x | 1.03x |
 | Exp 8: Gather/hash pipelining | 4,998 | 29.6x | 1.43x |
+
+## Analysis: Theoretical Minimum
+
+For 256 items × 16 rounds:
+- 4096 gather loads at 2/cycle = **2048 cycles minimum**
+- Target is 1,487 cycles - LESS than gather minimum!
+
+This means Claude must have found a way to:
+1. Reduce gather operations
+2. Process more loads per cycle somehow
+3. Use algorithmic shortcuts
+
+Current bottleneck analysis per 16-item batch:
+- Gather: 8 cycles (limited by 2 loads/cycle)
+- Hash: 12 cycles (limited by valu dependencies)
+- Index: 5 cycles
+- With current pipeline: ~17 cycles per batch × 16 batches × 16 rounds ≈ 4352 cycles

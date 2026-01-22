@@ -356,25 +356,41 @@ class KernelBuilder:
                     ]
                 self.instrs.append({"load": load_ops, "valu": valu_ops})
 
-            # Hash stages 4-5 for previous batch (no gather to overlap)
-            for hi in [4, 5]:
-                h_stage = HASH_STAGES[hi]
-                v_c1, v_c3 = v_hash_consts[hi]
-                self.instrs.append({"valu": [
-                    (h_stage[0], v_tmp1_a, v_val_prev_a, v_c1),
-                    (h_stage[3], v_tmp2_a, v_val_prev_a, v_c3),
-                    (h_stage[0], v_tmp1_b, v_val_prev_b, v_c1),
-                    (h_stage[3], v_tmp2_b, v_val_prev_b, v_c3),
-                ]})
-                self.instrs.append({"valu": [
-                    (h_stage[2], v_val_prev_a, v_tmp1_a, v_tmp2_a),
-                    (h_stage[2], v_val_prev_b, v_tmp1_b, v_tmp2_b),
-                ]})
-
-            # Index computation for previous batch
+            # Hash stages 4-5 for previous batch, overlapping idx*2 with hash 4 part 2
+            # Hash 4 part 1
+            h_stage = HASH_STAGES[4]
+            v_c1, v_c3 = v_hash_consts[4]
             self.instrs.append({"valu": [
-                ("&", v_tmp1_a, v_val_prev_a, v_one), ("*", v_idx_prev_a, v_idx_prev_a, v_two),
-                ("&", v_tmp1_b, v_val_prev_b, v_one), ("*", v_idx_prev_b, v_idx_prev_b, v_two),
+                (h_stage[0], v_tmp1_a, v_val_prev_a, v_c1),
+                (h_stage[3], v_tmp2_a, v_val_prev_a, v_c3),
+                (h_stage[0], v_tmp1_b, v_val_prev_b, v_c1),
+                (h_stage[3], v_tmp2_b, v_val_prev_b, v_c3),
+            ]})
+            # Hash 4 part 2 + idx*2 (overlapped!)
+            self.instrs.append({"valu": [
+                (h_stage[2], v_val_prev_a, v_tmp1_a, v_tmp2_a),
+                (h_stage[2], v_val_prev_b, v_tmp1_b, v_tmp2_b),
+                ("*", v_idx_prev_a, v_idx_prev_a, v_two),
+                ("*", v_idx_prev_b, v_idx_prev_b, v_two),
+            ]})
+            # Hash 5
+            h_stage = HASH_STAGES[5]
+            v_c1, v_c3 = v_hash_consts[5]
+            self.instrs.append({"valu": [
+                (h_stage[0], v_tmp1_a, v_val_prev_a, v_c1),
+                (h_stage[3], v_tmp2_a, v_val_prev_a, v_c3),
+                (h_stage[0], v_tmp1_b, v_val_prev_b, v_c1),
+                (h_stage[3], v_tmp2_b, v_val_prev_b, v_c3),
+            ]})
+            self.instrs.append({"valu": [
+                (h_stage[2], v_val_prev_a, v_tmp1_a, v_tmp2_a),
+                (h_stage[2], v_val_prev_b, v_tmp1_b, v_tmp2_b),
+            ]})
+
+            # Index computation (idx*2 already done above)
+            self.instrs.append({"valu": [
+                ("&", v_tmp1_a, v_val_prev_a, v_one),
+                ("&", v_tmp1_b, v_val_prev_b, v_one),
             ]})
             self.instrs.append({"valu": [
                 ("+", v_tmp3_a, v_one, v_tmp1_a), ("+", v_tmp3_b, v_one, v_tmp1_b),
