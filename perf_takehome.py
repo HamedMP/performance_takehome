@@ -235,8 +235,80 @@ class KernelBuilder:
         v_addr_a2 = self.alloc_scratch("v_addr_a2", VLEN)
         v_addr_b2 = self.alloc_scratch("v_addr_b2", VLEN)
 
-        # Main loop over rounds
-        self.instrs.append({"load": [("const", round_counter, 0)]})
+        # ============================================
+        # ROUND 0: All items have idx=0
+        # Use broadcast instead of gather (big optimization!)
+        # ============================================
+        v_tree0 = self.alloc_scratch("v_tree0", VLEN)
+        tree0_scalar = self.alloc_scratch("tree0_scalar")
+
+        # Load tree[0] and broadcast
+        self.instrs.append({"load": [("load", tree0_scalar, self.scratch["forest_values_p"])]})
+        self.instrs.append({"valu": [("vbroadcast", v_tree0, tree0_scalar)]})
+
+        # Process all batches for round 0 (no gathers needed!)
+        # Pack 4 vectors (2 batches) at a time for better valu utilization
+        v_tmp1_c = self.alloc_scratch("v_tmp1_c", VLEN)
+        v_tmp1_d = self.alloc_scratch("v_tmp1_d", VLEN)
+        v_tmp2_c = self.alloc_scratch("v_tmp2_c", VLEN)
+        v_tmp2_d = self.alloc_scratch("v_tmp2_d", VLEN)
+        v_tmp3_c = self.alloc_scratch("v_tmp3_c", VLEN)
+        v_tmp3_d = self.alloc_scratch("v_tmp3_d", VLEN)
+
+        for batch in range(0, NUM_BATCHES, 2):
+            ia, ib = batch * 2, batch * 2 + 1
+            ic, id = (batch + 1) * 2, (batch + 1) * 2 + 1
+            v_idx_a, v_val_a = all_idx[ia], all_val[ia]
+            v_idx_b, v_val_b = all_idx[ib], all_val[ib]
+            v_idx_c, v_val_c = all_idx[ic], all_val[ic]
+            v_idx_d, v_val_d = all_idx[id], all_val[id]
+
+            # XOR with tree[0] (4 vectors)
+            self.instrs.append({"valu": [
+                ("^", v_val_a, v_val_a, v_tree0),
+                ("^", v_val_b, v_val_b, v_tree0),
+                ("^", v_val_c, v_val_c, v_tree0),
+                ("^", v_val_d, v_val_d, v_tree0),
+            ]})
+
+            # Hash (6 stages) - process 4 vectors with 6 valu slots
+            for hi, (op1, val1, op2, op3, val3) in enumerate(HASH_STAGES):
+                v_c1, v_c3 = v_hash_consts[hi]
+                # First cycle: tmp1 and tmp2 for all 4 vectors (but only 6 slots!)
+                # Split: 4 tmp1 ops + 2 tmp2 ops in cycle 1
+                self.instrs.append({"valu": [
+                    (op1, v_tmp1_a, v_val_a, v_c1), (op1, v_tmp1_b, v_val_b, v_c1),
+                    (op1, v_tmp1_c, v_val_c, v_c1), (op1, v_tmp1_d, v_val_d, v_c1),
+                    (op3, v_tmp2_a, v_val_a, v_c3), (op3, v_tmp2_b, v_val_b, v_c3),
+                ]})
+                # Remaining tmp2 + final combine for a,b
+                self.instrs.append({"valu": [
+                    (op3, v_tmp2_c, v_val_c, v_c3), (op3, v_tmp2_d, v_val_d, v_c3),
+                    (op2, v_val_a, v_tmp1_a, v_tmp2_a),
+                    (op2, v_val_b, v_tmp1_b, v_tmp2_b),
+                ]})
+                # Final combine for c,d
+                self.instrs.append({"valu": [
+                    (op2, v_val_c, v_tmp1_c, v_tmp2_c),
+                    (op2, v_val_d, v_tmp1_d, v_tmp2_d),
+                ]})
+
+            # Index computation: idx=0, so new_idx = 0*2 + (1 or 2) = 1 or 2
+            # Simplified: new_idx = 1 + (val & 1)
+            self.instrs.append({"valu": [
+                ("&", v_tmp1_a, v_val_a, v_one), ("&", v_tmp1_b, v_val_b, v_one),
+                ("&", v_tmp1_c, v_val_c, v_one), ("&", v_tmp1_d, v_val_d, v_one),
+            ]})
+            self.instrs.append({"valu": [
+                ("+", v_idx_a, v_one, v_tmp1_a), ("+", v_idx_b, v_one, v_tmp1_b),
+                ("+", v_idx_c, v_one, v_tmp1_c), ("+", v_idx_d, v_one, v_tmp1_d),
+            ]})
+            # No wrapping check needed since 1 and 2 are < n_nodes
+
+        # ============================================
+        # ROUNDS 1 to rounds-1: Regular pipelined loop
+        # ============================================
+        self.instrs.append({"load": [("const", round_counter, 1)]})  # Start at round 1
         outer_loop_start = len(self.instrs)
 
         # PIPELINED INNER LOOP
