@@ -307,9 +307,99 @@ class KernelBuilder:
             # No wrapping check needed since 1 and 2 are < n_nodes
 
         # ============================================
-        # ROUNDS 1 to rounds-1: Regular pipelined loop
+        # ROUND 1: All indices are 1 or 2 (use arithmetic instead of gather)
         # ============================================
-        self.instrs.append({"load": [("const", round_counter, 1)]})  # Start at round 1
+        tree1_scalar = self.alloc_scratch("tree1_scalar")
+        tree2_scalar = self.alloc_scratch("tree2_scalar")
+        diff_scalar = self.alloc_scratch("diff_scalar")
+        v_tree1 = self.alloc_scratch("v_tree1", VLEN)
+        v_diff = self.alloc_scratch("v_diff", VLEN)
+        v_offset = self.alloc_scratch("v_offset", VLEN)
+        v_node_tmp = self.alloc_scratch("v_node_tmp", VLEN)
+
+        # Load tree[1] and tree[2]
+        self.instrs.append({"alu": [("+", addr_tmp, self.scratch["forest_values_p"], one_const)]})
+        self.instrs.append({"load": [("load", tree1_scalar, addr_tmp)]})
+        self.instrs.append({"alu": [("+", addr_tmp, self.scratch["forest_values_p"], two_const)]})
+        self.instrs.append({"load": [("load", tree2_scalar, addr_tmp)]})
+
+        # Compute diff = tree2 - tree1 and broadcast
+        self.instrs.append({"alu": [("-", diff_scalar, tree2_scalar, tree1_scalar)]})
+        self.instrs.append({"valu": [
+            ("vbroadcast", v_tree1, tree1_scalar),
+            ("vbroadcast", v_diff, diff_scalar),
+        ]})
+
+        # Process all vectors for round 1
+        for start_vec, num_vecs in vec_batches:
+            vecs = [(all_idx[i], all_val[i]) for i in range(start_vec, start_vec + num_vecs)]
+            tmp1_list = [v_tmp1_a, v_tmp1_b, v_tmp1_c, v_tmp1_d, v_tmp1_e, v_tmp1_f][:num_vecs]
+            tmp2_list = [v_tmp2_a, v_tmp2_b, v_tmp2_c, v_tmp2_d, v_tmp2_e, v_tmp2_f][:num_vecs]
+
+            # Compute node_val = tree1 + (idx - 1) * diff for each item
+            # First: offset = idx - 1
+            offset_ops = [("-", t1, v_idx, v_one) for (v_idx, v_val), t1 in zip(vecs, tmp1_list)]
+            self.instrs.append({"valu": offset_ops})
+
+            # node_val = tree1 + offset * diff = tree1 + tmp1 * diff
+            mul_ops = [("*", t2, t1, v_diff) for t1, t2 in zip(tmp1_list[:num_vecs], tmp2_list[:num_vecs])]
+            self.instrs.append({"valu": mul_ops})
+
+            add_node_ops = [("+", t1, v_tree1, t2) for t1, t2 in zip(tmp1_list[:num_vecs], tmp2_list[:num_vecs])]
+            self.instrs.append({"valu": add_node_ops})
+
+            # XOR: val = val ^ node_val (node_val is in tmp1_list now)
+            xor_ops = [("^", v_val, v_val, t1) for (v_idx, v_val), t1 in zip(vecs, tmp1_list)]
+            self.instrs.append({"valu": xor_ops})
+
+            # Hash (6 stages)
+            for hi, (op1, val1, op2, op3, val3) in enumerate(HASH_STAGES):
+                v_c1, v_c3 = v_hash_consts[hi]
+                ops1 = []
+                for i, ((v_idx, v_val), t1, t2) in enumerate(zip(vecs, tmp1_list, tmp2_list)):
+                    if len(ops1) < 6:
+                        ops1.append((op1, t1, v_val, v_c1))
+                    if len(ops1) < 6:
+                        ops1.append((op3, t2, v_val, v_c3))
+                self.instrs.append({"valu": ops1})
+
+                remaining_tmp = []
+                for i, ((v_idx, v_val), t1, t2) in enumerate(zip(vecs, tmp1_list, tmp2_list)):
+                    if i * 2 >= 6:
+                        remaining_tmp.append((op1, t1, v_val, v_c1))
+                    if i * 2 + 1 >= 6:
+                        remaining_tmp.append((op3, t2, v_val, v_c3))
+                if remaining_tmp:
+                    self.instrs.append({"valu": remaining_tmp})
+
+                combine_ops = [(op2, v_val, t1, t2) for (v_idx, v_val), t1, t2 in zip(vecs, tmp1_list, tmp2_list)]
+                self.instrs.append({"valu": combine_ops})
+
+            # Index computation: new_idx = idx * 2 + (1 + (val & 1))
+            # idx is 1 or 2, so idx*2 is 2 or 4
+            mul_idx_ops = [("*", v_idx, v_idx, v_two) for (v_idx, v_val) in vecs]
+            self.instrs.append({"valu": mul_idx_ops})
+
+            and_ops = [("&", t1, v_val, v_one) for (v_idx, v_val), t1 in zip(vecs, tmp1_list)]
+            self.instrs.append({"valu": and_ops})
+
+            add_one_ops = [("+", t1, v_one, t1) for t1 in tmp1_list[:num_vecs]]
+            self.instrs.append({"valu": add_one_ops})
+
+            add_idx_ops = [("+", v_idx, v_idx, t1) for (v_idx, v_val), t1 in zip(vecs, tmp1_list)]
+            self.instrs.append({"valu": add_idx_ops})
+
+            # Check idx < n_nodes and wrap if needed
+            cmp_ops = [("<", t1, v_idx, v_n_nodes) for (v_idx, v_val), t1 in zip(vecs, tmp1_list)]
+            self.instrs.append({"valu": cmp_ops})
+
+            wrap_ops = [("*", v_idx, v_idx, t1) for (v_idx, v_val), t1 in zip(vecs, tmp1_list)]
+            self.instrs.append({"valu": wrap_ops})
+
+        # ============================================
+        # ROUNDS 2 to rounds-1: Regular pipelined loop
+        # ============================================
+        self.instrs.append({"load": [("const", round_counter, 2)]})  # Start at round 2
         outer_loop_start = len(self.instrs)
 
         # PIPELINED INNER LOOP
