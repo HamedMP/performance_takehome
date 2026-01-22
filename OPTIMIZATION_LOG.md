@@ -127,6 +127,67 @@
 | Exp 6: Register persistence | 7,385 | 20.0x | 1.19x |
 | Exp 7: Optimized load/store | 7,158 | 20.6x | 1.03x |
 | Exp 8: Gather/hash pipelining | 4,998 | 29.6x | 1.43x |
+| Exp 9: Round 0 optimization | 4,988 | 29.6x | 1.00x |
+| Exp 10: 4-vector parallel hash | 4,892 | 30.2x | 1.02x |
+
+---
+
+## Experiment 10: 4-Vector Parallel Hash for Round 0
+
+**What I did:**
+- Process 4 vectors (32 items) at a time instead of 2
+- Better utilize 6 valu slots per cycle:
+  - XOR: 4 ops in 1 cycle
+  - Hash: Pipeline stages across 4 vectors (6 ops/cycle for tmp1,tmp2)
+  - Index: 6 ops/cycle where possible
+
+**Result:** 4,892 cycles (30.2x speedup, 1.02x from previous)
+
+**Analysis:**
+- Saved ~96 cycles in round 0
+- Better valu slot utilization
+- Still limited by dependencies in hash stages
+
+---
+
+## Experiment 9: Round 0 Single Load
+
+**What I did:**
+- All items start with idx=0, so they all access tree[0]
+- Instead of 256 gathers, load tree[0] once and broadcast to all items
+- Process 2 vectors at a time (like main loop) for round 0 separately
+- Main loop now runs 15 rounds (1-15) instead of 16
+
+**Result:** 4,988 cycles (29.6x speedup, tiny 0.2% improvement)
+
+**Analysis:**
+- Saved ~10 cycles by eliminating gather for round 0
+- The savings are minimal because the non-pipelined processing for round 0 still takes significant time
+- Round 0 without pipelining: ~290 cycles
+- Original pipelined round: ~312 cycles
+- Net savings: ~22 cycles minus setup overhead
+
+---
+
+## Experiment 9b: Round 1 Arithmetic Computation (FAILED)
+
+**What I did:**
+- After round 0, indices are 1 or 2 (only 2 unique values)
+- Loaded tree[1] and tree[2], computed node_val = tree1 + (idx-1) * (tree2-tree1)
+- This eliminates gather for round 1
+
+**Result:** 5,030 cycles (WORSE than before!)
+
+**Analysis:**
+- The arithmetic to compute node_val adds 3 extra cycles per batch
+- Lost the pipelining benefit (gather was overlapped with hash of previous batch)
+- Net result: 3 extra cycles × 16 batches = 48 cycles added
+- Gather savings: ~5 cycles (8 gather cycles - 3 setup cycles) × 16 batches = not enough to compensate
+- **Reverted this change**
+
+**Key Learning:** Eliminating gather operations only helps if we can maintain pipelining overlap. The gather-hash overlap is critical to current performance.
+
+---
 
 ## Analysis: Theoretical Minimum
 
@@ -144,3 +205,54 @@ Current bottleneck analysis per 16-item batch:
 - Hash: 12 cycles (limited by valu dependencies)
 - Index: 5 cycles
 - With current pipeline: ~17 cycles per batch × 16 batches × 16 rounds ≈ 4352 cycles
+
+---
+
+## Key Discovery: Index Pattern Repetition
+
+**Analysis of unique indices per round:**
+```
+Round | Unique Indices | Max Index
+------|----------------|----------
+   0  |        1       |       0
+   1  |        2       |       2
+   2  |        4       |       6
+   3  |        8       |      14
+   4  |       16       |      30
+   5  |       32       |      62
+   6  |       63       |     126
+   7  |      112       |     254
+   8  |      162       |     510
+   9  |      206       |    1021
+  10  |        1       |       0   <-- ALL wrap to 0!
+  11  |        2       |       2
+  12  |        4       |       6
+  13  |        8       |      14
+  14  |       16       |      30
+  15  |       32       |      62
+```
+
+**Key insight:** After round 9, all items have indices that exceed n_nodes (1023) after the idx*2+1/2 formula, causing ALL 256 items to wrap back to idx=0. This means:
+- Rounds 10-15 repeat the same pattern as rounds 0-5
+- Rounds 0 and 10: Only 1 unique index → could use 1 load + broadcast
+- Rounds 1-5 and 11-15: 2-32 unique indices → could preload and select
+
+**Potential savings:** If we could exploit this for all affected rounds, we could eliminate ~2946 of 4096 gather operations, saving ~1473 cycles theoretically.
+
+---
+
+## Experiment 11: Round 10 Special Handling (FAILED)
+
+**What I did:**
+- Attempted to restructure kernel to handle rounds 0, 1-9, 10, 11-15 separately
+- Created helper function `run_pipelined_rounds(start, end)` to avoid code duplication
+- Added special handling for round 10 (same as round 0)
+
+**Result:** Correctness failure on round 1
+
+**Analysis:**
+- The refactoring introduced a bug related to loop control or variable scoping
+- Complexity of nested functions with closures made debugging difficult
+- Reverted to working version (4998 cycles)
+
+**Key Learning:** Complex refactoring needs more careful testing. The current pipelined structure is fragile and hard to modify without introducing bugs.
