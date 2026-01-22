@@ -643,16 +643,13 @@ class KernelBuilder:
         self.instrs.append({"valu": [
             ("+", v_idx_last_a, v_idx_last_a, v_tmp3_a), ("+", v_idx_last_b, v_idx_last_b, v_tmp3_b),
         ]})
+        # Merge loop control with epilogue index computation
         self.instrs.append({"valu": [
             ("<", v_tmp1_a, v_idx_last_a, v_n_nodes), ("<", v_tmp1_b, v_idx_last_b, v_n_nodes),
-        ]})
+        ], "alu": [("+", round_counter, round_counter, one_const)]})
         self.instrs.append({"valu": [
             ("*", v_idx_last_a, v_idx_last_a, v_tmp1_a), ("*", v_idx_last_b, v_idx_last_b, v_tmp1_b),
-        ]})
-
-        # Round loop control (rounds 2-10, compare against 11)
-        self.instrs.append({"alu": [("+", round_counter, round_counter, one_const)]})
-        self.instrs.append({"alu": [("<", loop_cond, round_counter, eleven_const)]})
+        ], "alu": [("<", loop_cond, round_counter, eleven_const)]})
         self.instrs.append({"flow": [("cond_jump", loop_cond, outer_loop_start)]})
 
         # ============================================
@@ -982,16 +979,13 @@ class KernelBuilder:
         self.instrs.append({"valu": [
             ("+", v_idx_last2_a, v_idx_last2_a, v_tmp3_a), ("+", v_idx_last2_b, v_idx_last2_b, v_tmp3_b),
         ]})
+        # Merge loop control with epilogue index computation
         self.instrs.append({"valu": [
             ("<", v_tmp1_a, v_idx_last2_a, v_n_nodes), ("<", v_tmp1_b, v_idx_last2_b, v_n_nodes),
-        ]})
+        ], "alu": [("+", round_counter, round_counter, one_const)]})
         self.instrs.append({"valu": [
             ("*", v_idx_last2_a, v_idx_last2_a, v_tmp1_a), ("*", v_idx_last2_b, v_idx_last2_b, v_tmp1_b),
-        ]})
-
-        # Third loop control (rounds 13-15)
-        self.instrs.append({"alu": [("+", round_counter, round_counter, one_const)]})
-        self.instrs.append({"alu": [("<", loop_cond, round_counter, self.scratch["rounds"])]})
+        ], "alu": [("<", loop_cond, round_counter, self.scratch["rounds"])]})
         self.instrs.append({"flow": [("cond_jump", loop_cond, outer_loop_start_2)]})
 
         # Store ALL indices and values back to memory (optimized: 2 vstores per cycle)
